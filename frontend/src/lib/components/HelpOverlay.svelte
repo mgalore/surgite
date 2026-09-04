@@ -1,30 +1,61 @@
 <script lang="ts">
+	import { onMount } from 'svelte';
+
 	let { onclose }: { onclose: () => void } = $props();
+	let dialog: HTMLDivElement;
+	let previousFocus: HTMLElement | null = null;
+
+	function close() {
+		onclose();
+	}
 
 	function handleKey(e: KeyboardEvent) {
-		if (e.key === 'Escape' || e.key === 'q') onclose();
+		if (e.key === 'Escape' || e.key === 'q') {
+			close();
+			return;
+		}
+
+		if (e.key !== 'Tab') return;
+		const focusable = [...dialog.querySelectorAll<HTMLElement>(
+			'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+		)].filter((element) => !element.hidden);
+		const first = focusable[0];
+		const last = focusable.at(-1);
+
+		if (!first || !last) {
+			e.preventDefault();
+			dialog.focus();
+		} else if (e.shiftKey && document.activeElement === first) {
+			e.preventDefault();
+			last.focus();
+		} else if (!e.shiftKey && document.activeElement === last) {
+			e.preventDefault();
+			first.focus();
+		}
 	}
 
-	function handleBgClick(e: MouseEvent) {
-		if (e.target === e.currentTarget) onclose();
-	}
+	onMount(() => {
+		previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+		dialog.focus();
+		return () => previousFocus?.focus();
+	});
 </script>
 
 <svelte:window onkeydown={handleKey} />
 
-<!-- svelte-ignore a11y_click_events_have_key_events a11y_no_noninteractive_element_interactions -->
 <div
 	class="fixed inset-0 z-50 flex items-center justify-center bg-bg/80 p-4"
-	onclick={handleBgClick}
 	role="dialog"
 	aria-modal="true"
 	aria-label="Help"
 	tabindex="-1"
+	bind:this={dialog}
 >
-	<div class="w-full max-w-lg border border-border bg-surface p-6 text-sm text-fg">
+	<button class="absolute inset-0 cursor-default" aria-label="Close help" onclick={close} tabindex="-1"></button>
+	<div class="relative w-full max-w-lg border border-border bg-surface p-6 text-sm text-fg">
 		<div class="mb-4 flex items-center justify-between">
 			<h2 class="text-base font-semibold text-fg">:help</h2>
-			<button onclick={onclose} class="text-fg-muted hover:text-fg">✕</button>
+			<button onclick={close} class="text-fg-muted hover:text-fg" aria-label="Close help">✕</button>
 		</div>
 		<div class="space-y-3 text-fg-muted">
 			<p><span class="text-fg">surgite</span> generates standup summaries from your git commit history.</p>

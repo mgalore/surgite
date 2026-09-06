@@ -32,7 +32,6 @@
 	let konamiIdx = 0;
 
 	function handleKey(e: KeyboardEvent) {
-		if (showHelp && e.key === 'Escape') { showHelp = false; return; }
 		if (e.key === 'F1') { e.preventDefault(); showHelp = !showHelp; return; }
 
 		if (e.key === KONAMI[konamiIdx]) {

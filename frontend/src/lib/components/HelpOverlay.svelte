@@ -1,58 +1,49 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
-
 	let { onclose }: { onclose: () => void } = $props();
-	let dialog: HTMLDivElement;
-	let previousFocus: HTMLElement | null = null;
+	let dialog: HTMLDialogElement;
+
+	// showModal() is the whole accessibility contract: focus moves in, Tab is
+	// trapped, the rest of the page goes inert, and focus returns to whatever
+	// was focused before. Hand-rolling that runs ~40 lines and still leaks
+	// focus backwards off the first element.
+	$effect(() => {
+		dialog.showModal();
+	});
 
 	function close() {
+		// close() has to run while the node is still connected -- that is what
+		// restores focus to whatever opened the dialog. Svelte detaches the
+		// node before effect teardown, so closing from a cleanup restores
+		// nothing and focus lands on <body>.
+		dialog.close();
 		onclose();
 	}
 
 	function handleKey(e: KeyboardEvent) {
-		if (e.key === 'Escape' || e.key === 'q') {
-			close();
-			return;
-		}
-
-		if (e.key !== 'Tab') return;
-		const focusable = [...dialog.querySelectorAll<HTMLElement>(
-			'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
-		)].filter((element) => !element.hidden);
-		const first = focusable[0];
-		const last = focusable.at(-1);
-
-		if (!first || !last) {
-			e.preventDefault();
-			dialog.focus();
-		} else if (e.shiftKey && document.activeElement === first) {
-			e.preventDefault();
-			last.focus();
-		} else if (!e.shiftKey && document.activeElement === last) {
-			e.preventDefault();
-			first.focus();
-		}
+		if (e.key !== 'Escape' && e.key !== 'q' && e.key !== 'F1') return;
+		// +page.svelte toggles help from a window listener. Stop these there,
+		// or closing on F1 would immediately reopen.
+		e.stopPropagation();
+		e.preventDefault();
+		close();
 	}
 
-	onMount(() => {
-		previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-		dialog.focus();
-		return () => previousFocus?.focus();
-	});
+	// A click on the ::backdrop targets the dialog itself. The panel padding
+	// lives on the inner div so it cannot be mistaken for the backdrop.
+	function handleClick(e: MouseEvent) {
+		if (e.target === dialog) close();
+	}
 </script>
 
-<svelte:window onkeydown={handleKey} />
-
-<div
-	class="fixed inset-0 z-50 flex items-center justify-center bg-bg/80 p-4"
-	role="dialog"
-	aria-modal="true"
-	aria-label="Help"
-	tabindex="-1"
+<dialog
 	bind:this={dialog}
+	onclose={onclose}
+	onkeydown={handleKey}
+	onclick={handleClick}
+	aria-label="Help"
+	class="m-auto w-full max-w-lg border border-border bg-surface p-0 text-sm text-fg backdrop:bg-bg/80"
 >
-	<button class="absolute inset-0 cursor-default" aria-label="Close help" onclick={close} tabindex="-1"></button>
-	<div class="relative w-full max-w-lg border border-border bg-surface p-6 text-sm text-fg">
+	<div class="p-6">
 		<div class="mb-4 flex items-center justify-between">
 			<h2 class="text-base font-semibold text-fg">:help</h2>
 			<button onclick={close} class="text-fg-muted hover:text-fg" aria-label="Close help">✕</button>
@@ -72,4 +63,4 @@
 			<p class="text-fg-faint">Press <span class="text-fg-muted">Esc</span> or <span class="text-fg-muted">q</span> to close.</p>
 		</div>
 	</div>
-</div>
+</dialog>

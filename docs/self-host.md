@@ -204,6 +204,20 @@ certificate verification for every git operation and every registered repo —
 it makes the app vulnerable to MITM on clone/fetch. Prefer `GIT_SSL_CAINFO`
 whenever the host's CA is available.
 
+### Running as an unprivileged user
+
+The container does not run as root. The image creates a `surgite` system user
+and `entrypoint.sh` repairs the ownership of the two writable mounts
+(`surgite-repos` → `/var/surgite/repos` and `surgite-data` →
+`/var/surgite/data`) when the entrypoint starts as root, then drops to
+`surgite` with `setpriv` before running migrations and the app.
+
+Upgrading an existing deployment is automatic: the entrypoint's `chown` covers
+volumes that were populated root-owned by an older image, so no manual `chown`
+is needed. If you run the container with an explicit `--user`, make sure that
+user can write to `/var/surgite/repos`, `/var/surgite/data` and `/app`, or the
+app will fail at startup.
+
 ## Backup and restore
 
 `scripts/backup.sh` dumps the database to a gzip file in `BACKUP_DIR` (default

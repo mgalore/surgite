@@ -18,6 +18,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   should mount the CA bundle and set `GIT_SSL_CAINFO` instead. See
   [`docs/self-host.md`](docs/self-host.md). (#20)
 
+### Security
+
+- **The container no longer runs as root.** The image creates an unprivileged
+  `surgite` user; `entrypoint.sh` repairs the ownership of the two writable
+  mounts (`/var/surgite/repos`, `/var/surgite/data`) when it starts as root,
+  then drops to that user with `setpriv` before running migrations and the
+  app. Existing deployments upgrade without manual `chown` — the entrypoint
+  handles it on first start. See [`docs/self-host.md`](docs/self-host.md). (#21)
+
 ## [1.3.2] - 2026-09-04
 
 ### Fixed

@@ -173,11 +173,36 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # The upgrade path is the case issue #21 called the hard part, and the
+      # one a clean `down -v && up --build` does not cover: a named volume
+      # populated by an older root-running image stays root-owned, because
+      # Docker only chowns a volume's contents when it first creates it.
+      - name: Seed a root-owned repo volume, as an older image would leave it
+        run: |
+          docker volume create surgite_surgite-repos
+          docker run --rm -v surgite_surgite-repos:/v busybox \
+            sh -c 'mkdir -p /v/legacy && touch /v/legacy/HEAD && chown -R 0:0 /v'
+
       - name: Start the stack
         # No .env needed: every compose variable has a default. --wait blocks
         # on the healthchecks both services already define, so a green step
         # means migrations ran and /health answered.
         run: docker compose up -d --wait
+
+      - name: The app process is not root
+        # /proc/1/status via python, because `ps` is not in python:*-slim but
+        # python obviously is. `compose exec` would run as the image's default
+        # user, so PID 1 is the only honest thing to look at here.
+        run: |
+          docker compose exec -T app python -c \
+            "uid = int(open('/proc/1/status').read().split('Uid:')[1].split()[0]); \
+             print('PID 1 uid', uid); \
+             raise SystemExit('PID 1 is still root' if uid == 0 else 0)"
+
+      - name: The pre-existing volume is writable after the privilege drop
+        # -u surgite is what makes this mean anything: exec defaults to the
+        # image user (root), which could write regardless.
+        run: docker compose exec -T -u surgite app touch /var/surgite/repos/legacy/ci-write
 
       - name: App logs
         if: failure()

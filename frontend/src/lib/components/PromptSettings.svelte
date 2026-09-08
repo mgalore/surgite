@@ -8,11 +8,11 @@
 	import { toasts } from '$lib/toast.svelte';
 	import Skeleton from './Skeleton.svelte';
 
-	let { repos = [] }: { repos?: Repo[] } = $props();
+	let { repos = [], active = false }: { repos?: Repo[]; active?: boolean } = $props();
 
-	let expanded = $state(false);
 	let saving = $state(false);
 	let loading = $state(false);
+	let loaded = $state(false);
 
 	// null = the global default; a number = a specific repo's override.
 	let selectedRepoId = $state<number | null>(null);
@@ -65,10 +65,11 @@
 		}
 	}
 
-	async function toggle() {
-		expanded = !expanded;
-		if (expanded) await load();
-	}
+	$effect(() => {
+		if (!active || loaded || loading) return;
+		loaded = true;
+		void load();
+	});
 
 	async function selectRepo(value: string) {
 		selectedRepoId = value === '' ? null : Number(value);
@@ -97,23 +98,13 @@
 	const labelCls = 'text-xs text-fg-muted';
 </script>
 
-<section class="mt-6">
-	<button
-		onclick={toggle}
-		class="flex w-full items-center gap-1 text-sm text-fg-muted hover:text-fg transition"
-	>
-		<span class="text-accent">~/config</span>
-		<span aria-hidden="true">❯</span>
-		<span class="ml-auto text-xs">{expanded ? '▼' : '▶'}</span>
-	</button>
+<section>
+	<h2 class="text-sm text-fg-muted"><span class="text-accent">~/config</span> <span aria-hidden="true">❯</span></h2>
 
-	{#if expanded}
-		{#if loading}
-			<div class="mt-3">
-				<Skeleton rows={4} />
-			</div>
-		{:else}
-			<div class="mt-3 flex flex-wrap items-center gap-2">
+	{#if loading}
+		<div class="mt-3"><Skeleton rows={4} /></div>
+	{:else}
+		<div class="mt-3 flex flex-wrap items-center gap-2">
 				<label class={labelCls} for="ps-scope">Scope</label>
 				<select
 					id="ps-scope"
@@ -129,9 +120,9 @@
 				{#if inherited}
 					<span class="text-xs text-fg-faint">inherited from global — save to override for this repo</span>
 				{/if}
-			</div>
+		</div>
 
-			<div class="mt-3 grid grid-cols-1 gap-4 sm:grid-cols-2">
+		<div class="mt-3 grid grid-cols-1 gap-4 sm:grid-cols-2">
 				<div>
 					<label class={labelCls} for="ps-name">Name</label>
 					<input
@@ -191,15 +182,14 @@
 						class="{inputCls} resize-y"
 					></textarea>
 				</div>
-			</div>
+		</div>
 
-			<button
-				onclick={save}
-				disabled={saving}
-				class="mt-4 border border-border bg-accent px-4 py-1.5 text-sm font-medium text-accent-contrast transition hover:bg-accent-hover disabled:opacity-50"
-			>
-				{saving ? 'Saving…' : '❯ save'}
-			</button>
-		{/if}
+		<button
+			onclick={save}
+			disabled={saving}
+			class="mt-4 border border-border bg-accent px-4 py-1.5 text-sm font-medium text-accent-contrast transition hover:bg-accent-hover disabled:opacity-50"
+		>
+			{saving ? 'Saving…' : '❯ save'}
+		</button>
 	{/if}
 </section>

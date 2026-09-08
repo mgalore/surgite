@@ -1,26 +1,31 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { listRepos, type Repo } from '$lib/api';
-	import RepoList from '$lib/components/RepoList.svelte';
 	import AddRepoForm from '$lib/components/AddRepoForm.svelte';
-	import SummaryPanel from '$lib/components/SummaryPanel.svelte';
+	import HelpOverlay from '$lib/components/HelpOverlay.svelte';
 	import PromptSettings from '$lib/components/PromptSettings.svelte';
+	import RepoList from '$lib/components/RepoList.svelte';
+	import SummaryPanel from '$lib/components/SummaryPanel.svelte';
 	import ThemePicker from '$lib/components/ThemePicker.svelte';
 	import UserBadge from '$lib/components/UserBadge.svelte';
-	import HelpOverlay from '$lib/components/HelpOverlay.svelte';
+
+	type Workspace = 'summary' | 'repositories' | 'settings';
+	const WORKSPACES: Workspace[] = ['summary', 'repositories', 'settings'];
 
 	let repos = $state<Repo[]>([]);
 	let loading = $state(true);
 	let error = $state<string | null>(null);
 	let showHelp = $state(false);
+	let workspace = $state<Workspace>('summary');
+	let resultActive = $state(false);
 
 	async function loadRepos() {
 		loading = true;
 		error = null;
 		try {
 			repos = await listRepos();
-		} catch (e) {
-			error = e instanceof Error ? e.message : 'Failed to load repos';
+		} catch (cause) {
+			error = cause instanceof Error ? cause.message : 'Failed to load repos';
 		} finally {
 			loading = false;
 		}
@@ -28,13 +33,16 @@
 
 	onMount(loadRepos);
 
-	const KONAMI = ['ArrowUp','ArrowUp','ArrowDown','ArrowDown','ArrowLeft','ArrowRight','ArrowLeft','ArrowRight','b','a'];
+	const KONAMI = ['ArrowUp', 'ArrowUp', 'ArrowDown', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'ArrowLeft', 'ArrowRight', 'b', 'a'];
 	let konamiIdx = 0;
 
-	function handleKey(e: KeyboardEvent) {
-		if (e.key === 'F1') { e.preventDefault(); showHelp = !showHelp; return; }
-
-		if (e.key === KONAMI[konamiIdx]) {
+	function handleKey(event: KeyboardEvent) {
+		if (event.key === 'F1') {
+			event.preventDefault();
+			showHelp = !showHelp;
+			return;
+		}
+		if (event.key === KONAMI[konamiIdx]) {
 			konamiIdx++;
 			if (konamiIdx === KONAMI.length) {
 				konamiIdx = 0;
@@ -44,21 +52,37 @@
 			konamiIdx = 0;
 		}
 	}
+
+	function openWorkspace(next: Workspace) {
+		workspace = next;
+	}
+
+	function handleWorkspaceKeydown(event: KeyboardEvent, current: Workspace) {
+		const index = WORKSPACES.indexOf(current);
+		let nextIndex: number | null = null;
+		if (event.key === 'ArrowLeft') nextIndex = (index - 1 + WORKSPACES.length) % WORKSPACES.length;
+		if (event.key === 'ArrowRight') nextIndex = (index + 1) % WORKSPACES.length;
+		if (event.key === 'Home') nextIndex = 0;
+		if (event.key === 'End') nextIndex = WORKSPACES.length - 1;
+		if (nextIndex === null) return;
+		event.preventDefault();
+		const next = WORKSPACES[nextIndex];
+		workspace = next;
+		document.getElementById(`${next}-tab`)?.focus();
+	}
 </script>
 
 <svelte:head>
 	<title>surgite — git standup summaries</title>
-	<meta name="description" content="Generate standup summaries from your git commit history." />
+	<meta name="description" content="Generate standup summaries from your git history." />
 </svelte:head>
 
 <svelte:window onkeydown={handleKey} />
 
-<main class="mx-auto min-h-screen max-w-2xl px-4 py-6 sm:px-6 sm:py-10">
+<main class="mx-auto min-h-screen px-4 py-6 transition-[max-width] sm:px-6 sm:py-10 {workspace === 'summary' && resultActive ? 'max-w-5xl' : 'max-w-2xl'}">
 	<div class="border border-border bg-surface">
 		<div class="flex items-center justify-between gap-2 border-b border-border px-3 py-2">
-			<span class="flex-1 text-xs text-fg-muted">
-				surgite
-			</span>
+			<span class="flex-1 text-xs text-fg-muted">surgite</span>
 			<div class="flex items-center gap-2">
 				<a href="/summaries" class="text-xs text-fg-muted transition hover:text-fg">summaries</a>
 				<UserBadge />
@@ -67,33 +91,31 @@
 		</div>
 
 		<div class="px-4 py-6 sm:px-6">
-			<div class="flex items-center gap-2">
-				<span class="text-accent" aria-hidden="true">&gt;_</span>
-				<h1 class="text-lg font-semibold text-fg">surgite</h1>
-				<span class="cursor" aria-hidden="true"></span>
-			</div>
+			<div class="flex items-center gap-2"><span class="text-accent" aria-hidden="true">&gt;_</span><h1 class="text-lg font-semibold text-fg">surgite</h1><span class="cursor" aria-hidden="true"></span></div>
 			<p class="mt-1 text-sm text-fg-muted">Generate standup summaries from your git history.</p>
 			<div class="mt-1 border-b border-border-subtle border-dashed"></div>
+
+			<div class="mt-4 flex gap-1 border-b border-border-subtle text-sm" role="tablist" aria-label="Workspace">
+				<button id="summary-tab" type="button" role="tab" aria-controls="summary-panel" aria-selected={workspace === 'summary'} onclick={() => openWorkspace('summary')} onkeydown={(event) => handleWorkspaceKeydown(event, 'summary')} class="border-b-2 px-3 py-1.5 transition {workspace === 'summary' ? 'border-accent text-fg' : 'border-transparent text-fg-muted hover:text-fg'}">Summary</button>
+				<button id="repositories-tab" type="button" role="tab" aria-controls="repositories-panel" aria-selected={workspace === 'repositories'} onclick={() => openWorkspace('repositories')} onkeydown={(event) => handleWorkspaceKeydown(event, 'repositories')} class="border-b-2 px-3 py-1.5 transition {workspace === 'repositories' ? 'border-accent text-fg' : 'border-transparent text-fg-muted hover:text-fg'}">Repositories</button>
+				<button id="settings-tab" type="button" role="tab" aria-controls="settings-panel" aria-selected={workspace === 'settings'} onclick={() => openWorkspace('settings')} onkeydown={(event) => handleWorkspaceKeydown(event, 'settings')} class="border-b-2 px-3 py-1.5 transition {workspace === 'settings' ? 'border-accent text-fg' : 'border-transparent text-fg-muted hover:text-fg'}">Settings</button>
+			</div>
 		</div>
 
-		<section class="px-4 pb-2 sm:px-6">
-			<h2 class="text-sm text-fg-muted">
-				<span class="text-accent">~/repos</span> <span aria-hidden="true">❯</span>
-			</h2>
-			<AddRepoForm onAdded={loadRepos} />
-			<RepoList {repos} {loading} {error} onChanged={loadRepos} />
-		</section>
-
-		<section class="px-4 pb-2 sm:px-6">
-			<PromptSettings {repos} />
-		</section>
-
-		<section class="px-4 pb-6 sm:px-6">
-			<SummaryPanel {repos} />
-		</section>
+		<div id="summary-panel" role="tabpanel" aria-labelledby="summary-tab" hidden={workspace !== 'summary'} class="px-4 pb-6 sm:px-6">
+			<SummaryPanel {repos} bind:resultActive onOpenRepos={() => openWorkspace('repositories')} />
+		</div>
+		<div id="repositories-panel" role="tabpanel" aria-labelledby="repositories-tab" hidden={workspace !== 'repositories'} class="px-4 pb-6 sm:px-6">
+			<div class="max-w-2xl">
+				<h2 class="text-sm text-fg-muted"><span class="text-accent">~/repos</span> <span aria-hidden="true">❯</span></h2>
+				<AddRepoForm onAdded={loadRepos} />
+				<RepoList {repos} {loading} {error} onChanged={loadRepos} />
+			</div>
+		</div>
+		<div id="settings-panel" role="tabpanel" aria-labelledby="settings-tab" hidden={workspace !== 'settings'} class="px-4 pb-6 sm:px-6">
+			<div class="max-w-2xl"><PromptSettings {repos} active={workspace === 'settings'} /></div>
+		</div>
 	</div>
 </main>
 
-{#if showHelp}
-	<HelpOverlay onclose={() => (showHelp = false)} />
-{/if}
+{#if showHelp}<HelpOverlay onclose={() => (showHelp = false)} />{/if}

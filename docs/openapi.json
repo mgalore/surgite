@@ -1362,6 +1362,22 @@
               "title": "Hash",
               "type": "string"
             }
+          },
+          {
+            "in": "query",
+            "name": "repo",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Repo"
+            }
           }
         ],
         "responses": {

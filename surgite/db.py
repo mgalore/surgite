@@ -10,6 +10,7 @@ from sqlalchemy import (
     Date,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     String,
     UniqueConstraint,
@@ -157,14 +158,19 @@ class InviteRow(Base):
 
 class CommitRow(Base):
     __tablename__ = "commits"
+    __table_args__ = (Index("ix_commits_owner_repo_date", "owner_id", "repo_id", "date"),)
 
+    # A commit can belong to more than one registered repository (notably a
+    # fork and its upstream). Identity is therefore repository-local.
     hash: Mapped[str] = mapped_column(String, primary_key=True)
     short_hash: Mapped[str] = mapped_column(String(7))
     date: Mapped[date] = mapped_column(Date)
     author: Mapped[str] = mapped_column(String)
     message: Mapped[str] = mapped_column(String)
     repo: Mapped[str] = mapped_column(String)
-    repo_id: Mapped[int] = mapped_column(ForeignKey("repos.id", ondelete="CASCADE"))
+    repo_id: Mapped[int] = mapped_column(
+        ForeignKey("repos.id", ondelete="CASCADE"), primary_key=True
+    )
     owner_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     ingested_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

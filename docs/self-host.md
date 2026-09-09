@@ -106,6 +106,14 @@ app starts. They then can't be selected, can't have per-user keys stored
 against them, and aren't contacted by `/health/deep`'s reachability probe.
 `GET /providers` returning only `local` is the check that it took effect.
 
+## Scaling repository sync
+
+Surgite fetches repository metadata without checking files out, then syncs up
+to four repositories at a time. Set `INGEST_CONCURRENCY=1` when the Git host
+or machine needs serial work, or raise it cautiously for a large repository
+set. `GIT_TIMEOUT_SECONDS` defaults to `120` and bounds each clone, fetch, and
+log command.
+
 `LOCAL_MODEL` is optional. Left unset, the app asks your server what it
 serves (`GET /models`) on the first summary and uses that, caching the answer
 for the life of the process. A box serving one model therefore needs no model

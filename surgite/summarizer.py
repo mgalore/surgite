@@ -428,6 +428,7 @@ async def generate_summary(
     settings: dict | None = None,
     client: httpx.AsyncClient | None = None,
     user_id: str | None = None,
+    api_key: str | None = None,
 ) -> dict:
     """Summarize a formatted commit log with the chosen (or default) provider.
 
@@ -438,7 +439,7 @@ async def generate_summary(
     the per-user provider key in multi_user mode (falls back to the env-var
     key when the user has no row)."""
     resolved = resolve_provider(provider)
-    api_key = _resolve_key(resolved, user_id)
+    api_key = api_key or _resolve_key(resolved, user_id)
     system = _build_system_prompt(settings)
 
     async def run(c: httpx.AsyncClient) -> dict:
@@ -458,6 +459,8 @@ async def generate_summary_per_repo(
     settings: dict | None = None,
     settings_by_repo: dict[str, dict] | None = None,
     user_id: str | None = None,
+    api_key: str | None = None,
+    model: str | None = None,
 ) -> dict[str, dict[str, str]]:
     """Generate one AI summary per repo, calling the provider concurrently over
     a single shared connection pool. Returns {repo_name: {summary, provider,
@@ -473,26 +476,50 @@ async def generate_summary_per_repo(
 
     if pending:
         sem = asyncio.Semaphore(_MAX_PARALLEL_SUMMARIES)
+        chosen_model: str | None = None
+
+        def failure(exc: ProviderError | httpx.HTTPError) -> dict[str, str]:
+            prefix = "Error" if isinstance(exc, ProviderError) else "Provider request failed"
+            return {"summary": f"{prefix}: {exc}", "provider": "", "model": ""}
 
         async def summarize(client: httpx.AsyncClient, name: str, log_text: str) -> dict[str, str]:
             async with sem:
                 try:
+                    if chosen_model is None and api_key is None:
+                        return await generate_summary(
+                            log_text,
+                            provider=provider,
+                            settings=by_repo.get(name, settings),
+                            client=client,
+                            user_id=user_id,
+                        )
                     return await generate_summary(
                         log_text,
                         provider=provider,
+                        model=chosen_model,
                         settings=by_repo.get(name, settings),
                         client=client,
                         user_id=user_id,
+                        api_key=api_key,
                     )
-                except ProviderError as e:
-                    return {"summary": f"Error: {e}", "provider": "", "model": ""}
-                except httpx.HTTPError as e:
-                    return {"summary": f"Provider request failed: {e}", "provider": "", "model": ""}
+                except (ProviderError, httpx.HTTPError) as exc:
+                    return failure(exc)
 
         async with httpx.AsyncClient() as client:
-            results = await asyncio.gather(
-                *(summarize(client, name, log) for name, log in pending.items())
-            )
+            # API callers pass the key once per request, which also lets this
+            # path discover a local model once before fan-out. Preserve the
+            # public helper's per-repository error capture when called alone.
+            try:
+                if api_key is not None or model is not None:
+                    resolved = resolve_provider(provider)
+                    resolved_key = api_key or _resolve_key(resolved, user_id)
+                    chosen_model = model or await resolve_model(client, resolved, resolved_key)
+            except ProviderError as exc:
+                results = [failure(exc) for _ in pending]
+            else:
+                results = await asyncio.gather(
+                    *(summarize(client, name, log) for name, log in pending.items())
+                )
         summaries = dict(zip(pending, results, strict=True))
 
     empty = {"summary": "No commits in this period.", "provider": "", "model": ""}
@@ -506,6 +533,7 @@ async def stream_summary(
     settings: dict | None = None,
     client: httpx.AsyncClient | None = None,
     user_id: str | None = None,
+    api_key: str | None = None,
 ) -> AsyncIterator[str]:
     """Yield text deltas as the provider streams its summary. Resolves the
     provider and key up front (raising ProviderError before any I/O), then
@@ -516,7 +544,7 @@ async def stream_summary(
     caller, which maps them to an SSE `error` event. `user_id` selects the
     per-user provider key in multi_user mode."""
     resolved = resolve_provider(provider)
-    api_key = _resolve_key(resolved, user_id)
+    api_key = api_key or _resolve_key(resolved, user_id)
     system = _build_system_prompt(settings)
 
     async def pump(c: httpx.AsyncClient) -> AsyncIterator[str]:

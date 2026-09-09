@@ -4,8 +4,12 @@ import logging
 import os
 import secrets
 import threading
+import time
 from collections import defaultdict
+from collections.abc import AsyncIterator
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -14,7 +18,7 @@ from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Req
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -107,6 +111,10 @@ def _ingest_interval_seconds() -> int:
     return int(os.environ.get("INGEST_INTERVAL", "300"))
 
 
+def _ingest_concurrency() -> int:
+    return max(1, int(os.environ.get("INGEST_CONCURRENCY", "4")))
+
+
 def _claim_ingest(repo_id: int) -> bool:
     """Atomically reserve a repo for ingestion in this process."""
     with _active_ingests_lock:
@@ -121,7 +129,7 @@ def _release_ingest(repo_id: int) -> None:
         _active_ingests.discard(repo_id)
 
 
-def _ingest_all_repos() -> list[dict]:
+def _ingest_all_repos(executor: ThreadPoolExecutor | None = None) -> list[dict]:
     """Ingest every registered repo. The background scheduler calls this on
     a timer (see `_scheduler_loop`); the /summary endpoint itself stays a
     pure read against the DB. The per-repo ingest (`_ingest_repo`) is still
@@ -132,10 +140,12 @@ def _ingest_all_repos() -> list[dict]:
     with session_scope() as s:
         repo_data = [(r.id, r.name) for r in s.scalars(select(RepoRow)).all()]
 
-    for repo_id, repo_name in repo_data:
-        if not _claim_ingest(repo_id):
-            continue
-        results.append(_run_ingest(repo_id, fallback_name=repo_name))
+    work = [(repo_id, repo_name) for repo_id, repo_name in repo_data if _claim_ingest(repo_id)]
+    if executor is None:
+        return [_run_ingest(repo_id, fallback_name=repo_name) for repo_id, repo_name in work]
+    futures = [executor.submit(_run_ingest, repo_id, repo_name) for repo_id, repo_name in work]
+    for future in futures:
+        results.append(future.result())
 
     return results
 
@@ -154,49 +164,46 @@ def _ingest_repo(
     from surgite.config import REPO_CACHE_DIR
     from surgite.git import ensure_repo
 
-    actual_path = ensure_repo(repo_name, clone_url, REPO_CACHE_DIR)
+    actual_path = ensure_repo(repo_name, clone_url, REPO_CACHE_DIR, config.GIT_TIMEOUT_SECONDS)
 
     since_str = (since or date.today() - timedelta(days=7)).isoformat()
     until_str = (until or date.today()).isoformat()
 
-    raw = get_raw_log(actual_path, since_str, until_str)
+    raw = get_raw_log(actual_path, since_str, until_str, timeout=config.GIT_TIMEOUT_SECONDS)
     commits = parse_log(raw)
     inserted = updated = unchanged = 0
 
     with session_scope(session) as s:
-        existing: dict[str, CommitRow] = {}
-        if commits:
-            existing = {
-                row.hash: row
-                for row in s.scalars(
-                    select(CommitRow).where(CommitRow.hash.in_([c.hash for c in commits]))
-                )
-            }
-        now = datetime.now(UTC)
-        for c in commits:
-            row = existing.get(c.hash)
-            if row is None:
-                s.add(
-                    CommitRow(
-                        hash=c.hash,
-                        short_hash=c.hash[:7],
-                        date=c.date,
-                        author=c.author,
-                        message=c.message,
-                        repo=repo_name,
-                        repo_id=repo_id,
-                        owner_id=owner_id,
-                        ingested_at=now,
+        existing: set[str] = set()
+        for start in range(0, len(commits), 500):
+            hashes = [c.hash for c in commits[start : start + 500]]
+            existing.update(
+                s.scalars(
+                    select(CommitRow.hash).where(
+                        CommitRow.repo_id == repo_id, CommitRow.hash.in_(hashes)
                     )
                 )
-                inserted += 1
-            elif row.repo_id != repo_id:
-                row.repo_id = repo_id
-                row.repo = repo_name
-                row.ingested_at = now
-                updated += 1
-            else:
-                unchanged += 1
+            )
+        now = datetime.now(UTC)
+        new_rows = [
+            CommitRow(
+                hash=c.hash,
+                short_hash=c.hash[:7],
+                date=c.date,
+                author=c.author,
+                message=c.message,
+                repo=repo_name,
+                repo_id=repo_id,
+                owner_id=owner_id,
+                ingested_at=now,
+            )
+            for c in commits
+            if c.hash not in existing
+        ]
+        for start in range(0, len(new_rows), 500):
+            s.add_all(new_rows[start : start + 500])
+        inserted = len(new_rows)
+        unchanged = len(commits) - inserted
 
         s.commit()
 
@@ -206,6 +213,7 @@ def _ingest_repo(
 def _run_ingest(repo_id: int, fallback_name: str | None = None) -> dict:
     """Run one previously-reserved ingest and persist its completed outcome."""
     repo_name = fallback_name or str(repo_id)
+    started = time.monotonic()
     try:
         with session_scope() as s:
             repo = s.get(RepoRow, repo_id)
@@ -224,6 +232,11 @@ def _run_ingest(repo_id: int, fallback_name: str | None = None) -> dict:
                 repo.last_ingested_at = completed_at
                 repo.last_ingest_error = None
                 s.commit()
+        log.info(
+            "Ingest completed for %s",
+            repo_name,
+            extra={**result, "duration_seconds": round(time.monotonic() - started, 3)},
+        )
         return result
     except Exception as exc:
         completed_at = datetime.now(UTC)
@@ -252,16 +265,16 @@ def _delete_expired_summaries() -> int:
         return len(rows)
 
 
-def _scheduler_tick() -> None:
+def _scheduler_tick(executor: ThreadPoolExecutor) -> None:
     """One pass of the background work: ingest every repo, prune expired share
     slugs, and purge expired sessions. Runs in a thread (sync DB + git) off
     the event loop."""
-    _ingest_all_repos()
+    _ingest_all_repos(executor)
     _delete_expired_summaries()
     purge_expired_sessions()
 
 
-async def _scheduler_loop(interval: int) -> None:
+async def _scheduler_loop(interval: int, executor: ThreadPoolExecutor) -> None:
     """Background task: every `interval` seconds, ingest all registered repos
     and prune expired share slugs.
 
@@ -270,11 +283,10 @@ async def _scheduler_loop(interval: int) -> None:
     continues — a transient git failure must not stop the scheduler. Stops
     cleanly when the task is cancelled at app shutdown."""
     log.info("Background ingest scheduler started (interval=%ds)", interval)
-    loop = asyncio.get_running_loop()
     try:
         while True:
             try:
-                await loop.run_in_executor(None, _scheduler_tick)
+                await asyncio.to_thread(_scheduler_tick, executor)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -307,9 +319,13 @@ async def _lifespan(app: FastAPI):
             )
 
     interval = _ingest_interval_seconds()
+    executor = ThreadPoolExecutor(
+        max_workers=_ingest_concurrency(), thread_name_prefix="surgite-ingest"
+    )
+    app.state.ingest_executor = executor
     task: asyncio.Task | None = None
     if interval > 0:
-        task = asyncio.create_task(_scheduler_loop(interval))
+        task = asyncio.create_task(_scheduler_loop(interval, executor))
     try:
         yield
     finally:
@@ -319,6 +335,25 @@ async def _lifespan(app: FastAPI):
                 await task
             except asyncio.CancelledError:
                 pass
+        # Shutdown is only reached during application teardown. Waiting here
+        # lets in-flight Git subprocesses finish within their own timeout.
+        executor.shutdown(wait=True, cancel_futures=True)
+        if getattr(app.state, "ingest_executor", None) is executor:
+            app.state.ingest_executor = None
+
+
+async def _await_ingest(future: Future[dict]) -> None:
+    await asyncio.wrap_future(future)
+
+
+def _submit_ingest(
+    background: BackgroundTasks, request: Request, repo_id: int, repo_name: str
+) -> None:
+    executor: ThreadPoolExecutor | None = getattr(request.app.state, "ingest_executor", None)
+    if executor is None:  # TestClient without a lifespan; production always has the pool.
+        background.add_task(_run_ingest, repo_id, repo_name)
+    else:
+        background.add_task(_await_ingest, executor.submit(_run_ingest, repo_id, repo_name))
 
 
 # Document the stable error envelope once, for every route. OpenAPI's
@@ -1573,6 +1608,7 @@ def _looks_like_hash(value: str) -> bool:
 )
 def get_commit(
     hash: str,
+    repo: str | None = None,
     session: Session = Depends(get_db),
     current_user: UserRow = Depends(get_current_user),
 ):
@@ -1585,16 +1621,21 @@ def get_commit(
             detail="Hash must be hex and at least 7 characters",
         )
 
-    rows = session.scalars(
-        select(CommitRow).where(
-            CommitRow.hash.startswith(hash.lower()),
-            CommitRow.owner_id == current_user.id,
+    q = select(CommitRow).where(
+        CommitRow.hash.startswith(hash.lower()), CommitRow.owner_id == current_user.id
+    )
+    if repo is not None:
+        repo_row = session.scalar(
+            select(RepoRow).where(RepoRow.name == repo, RepoRow.owner_id == current_user.id)
         )
-    ).all()
+        if repo_row is None:
+            raise HTTPException(status_code=404, detail="Commit not found")
+        q = q.where(CommitRow.repo_id == repo_row.id)
+    rows = session.scalars(q.order_by(CommitRow.repo_id)).all()
 
     if not rows:
         raise HTTPException(status_code=404, detail="Commit not found")
-    if len(rows) > 1:
+    if len({row.hash for row in rows}) > 1:
         raise HTTPException(
             status_code=409,
             detail={
@@ -1641,14 +1682,103 @@ def _source_sync_snapshot(
     }
 
 
-def _repo_name_to_id(session: Session, owner_id: str) -> dict[str, int]:
-    return {
-        r.name: r.id
-        for r in session.scalars(select(RepoRow).where(RepoRow.owner_id == owner_id)).all()
-    }
+@dataclass(frozen=True)
+class PreparedSummary:
+    total: int
+    by_repo: dict[str, int]
+    by_day: dict[str, int]
+    log_by_repo: dict[str, str]
+    source_synced_at: dict[str, str | None]
+    global_settings: dict
+    settings_by_repo: dict[str, dict]
+    commits: list[dict]
 
 
-def _check_ai_preconditions(request: Request, provider: str | None, total: int, *, user_id: str):
+def _prepare_summary(
+    *,
+    since: date | None,
+    until: date | None,
+    author: str | None,
+    repo: str | None,
+    owner_id: str,
+    ai: bool,
+) -> PreparedSummary:
+    """Read and format one summary snapshot in a short-lived worker session."""
+    with session_scope() as session:
+        source_synced_at = _source_sync_snapshot(session, owner_id, repo)
+        q = select(CommitRow).where(CommitRow.owner_id == owner_id)
+        if since:
+            q = q.where(CommitRow.date >= since)
+        if until:
+            q = q.where(CommitRow.date <= until)
+        if author:
+            q = q.where(CommitRow.author.ilike(f"%{_escape_like(author)}%", escape="\\"))
+        if repo:
+            repo_row = session.scalar(
+                select(RepoRow).where(RepoRow.name == repo, RepoRow.owner_id == owner_id)
+            )
+            if repo_row is None:
+                return PreparedSummary(0, {}, {}, {}, {}, {}, {}, [])
+            q = q.where(CommitRow.repo_id == repo_row.id)
+
+        total = session.scalar(select(func.count()).select_from(q.subquery())) or 0
+        if ai and total > AI_SUMMARY_MAX_COMMITS:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"Too many commits for AI summary ({total} > {AI_SUMMARY_MAX_COMMITS}); "
+                    "narrow the date range."
+                ),
+            )
+        # The extra row catches a concurrent ingest between count and fetch.
+        rows = session.scalars(
+            q.order_by(CommitRow.date.desc()).limit(501)
+            if ai
+            else q.order_by(CommitRow.date.desc())
+        ).all()
+        if ai and len(rows) > AI_SUMMARY_MAX_COMMITS:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"Too many commits for AI summary (> {AI_SUMMARY_MAX_COMMITS}); narrow the date range."
+                ),
+            )
+        commit_rows = [_row_to_dict(row) for row in rows]
+        by_repo, by_day, repo_commits = _aggregate_commits(commit_rows)
+        log_by_repo = {name: format_log(commits) for name, commits in repo_commits.items()}
+        repo_ids = [row.repo_id for row in rows]
+        settings_rows = session.scalars(
+            select(PromptSettingsRow).where(
+                PromptSettingsRow.owner_id == owner_id,
+                or_(PromptSettingsRow.repo_id.is_(None), PromptSettingsRow.repo_id.in_(repo_ids)),
+            )
+        ).all()
+        settings = {row.repo_id: _settings_row_to_dict(row) for row in settings_rows}
+        global_settings = settings.get(None, {})
+        names_by_id = {
+            row.id: row.name
+            for row in session.scalars(select(RepoRow).where(RepoRow.id.in_(repo_ids))).all()
+        }
+        settings_by_repo = {
+            names_by_id[repo_id]: settings.get(repo_id, global_settings)
+            for repo_id in set(repo_ids)
+            if repo_id in names_by_id
+        }
+    return PreparedSummary(
+        total,
+        dict(by_repo),
+        dict(sorted(by_day.items())),
+        log_by_repo,
+        source_synced_at,
+        global_settings,
+        settings_by_repo,
+        commit_rows,
+    )
+
+
+async def _check_ai_preconditions(
+    request: Request, provider: str | None, total: int, *, user_id: str
+):
     """Shared gate for the AI paths: per-user + per-IP-outer rate limit.
     The per-user 5/60s bucket is the primary throttle — one user can't
     burn the LLM budget for everyone. The 100/60s per-IP
@@ -1674,10 +1804,10 @@ def _check_ai_preconditions(request: Request, provider: str | None, total: int, 
     try:
         from surgite.summarizer import _resolve_key
 
-        _resolve_key(resolved, user_id)
+        api_key = await asyncio.to_thread(_resolve_key, resolved, user_id)
     except ProviderError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
-    return resolved
+    return resolved, api_key
 
 
 @app.get(
@@ -1709,40 +1839,40 @@ async def summary(
     This is a pure read against the DB; freshness is owned by the background
     ingest scheduler (see _scheduler_loop) and the per-repo BackgroundTask
     on POST /repos. No git fetch happens here."""
-    source_sync_snapshot = _source_sync_snapshot(session, current_user.id, repo)
-    total, commit_rows = _query_commits(
-        since, until, author, repo, limit=None, offset=0, owner_id=current_user.id, session=session
+    prepared = await asyncio.to_thread(
+        _prepare_summary,
+        since=since,
+        until=until,
+        author=author,
+        repo=repo,
+        owner_id=current_user.id,
+        ai=ai,
     )
-    by_repo, by_day, repo_commits = _aggregate_commits(commit_rows)
-    log_by_repo = {name: format_log(cs) for name, cs in repo_commits.items()}
 
     ai_summary = None
     ai_provider = None
     ai_model = None
     ai_summaries = None
     if ai:
-        _check_ai_preconditions(request, provider, total, user_id=current_user.id)
-        name_to_id = _repo_name_to_id(session, current_user.id)
-        global_settings = _resolve_settings_dict(session, None, current_user.id)
-        settings_by_repo = {
-            name: _resolve_settings_dict(session, name_to_id.get(name), current_user.id)
-            for name in log_by_repo
-        }
+        _, api_key = await _check_ai_preconditions(
+            request, provider, prepared.total, user_id=current_user.id
+        )
         ai_summaries = await summarizer.generate_summary_per_repo(
-            log_by_repo,
+            prepared.log_by_repo,
             provider=provider,
-            settings=global_settings,
-            settings_by_repo=settings_by_repo,
+            settings=prepared.global_settings,
+            settings_by_repo=prepared.settings_by_repo,
             user_id=current_user.id,
+            api_key=api_key,
         )
         if combined:
-            all_commit_objs = [c for cs in repo_commits.values() for c in cs]
             try:
                 result = await summarizer.generate_summary(
-                    format_log(all_commit_objs),
+                    "\n".join(prepared.log_by_repo.values()),
                     provider=provider,
-                    settings=global_settings,
+                    settings=prepared.global_settings,
                     user_id=current_user.id,
+                    api_key=api_key,
                 )
             except ProviderError as e:
                 raise HTTPException(status_code=400, detail=str(e)) from e
@@ -1757,12 +1887,14 @@ async def summary(
             "since": since.isoformat() if since else None,
             "until": until.isoformat() if until else None,
         },
-        "total_commits": total,
-        "by_repo": dict(by_repo),
-        "by_day": dict(sorted(by_day.items())),
-        "source_synced_at": {name: source_sync_snapshot.get(name) for name in by_repo},
-        "commits": commit_rows if commits else [],
-        "log_by_repo": log_by_repo,
+        "total_commits": prepared.total,
+        "by_repo": prepared.by_repo,
+        "by_day": prepared.by_day,
+        "source_synced_at": {
+            name: prepared.source_synced_at.get(name) for name in prepared.by_repo
+        },
+        "commits": prepared.commits if commits else [],
+        "log_by_repo": prepared.log_by_repo,
         "ai_summary": ai_summary,
         "ai_provider": ai_provider,
         "ai_model": ai_model,
@@ -1799,60 +1931,97 @@ async def summary_stream(
     All DB reads happen up front: the StreamingResponse generator runs after
     the request handler returns and the Depends-injected session is closed, so
     it must only touch the provider, never the DB."""
-    source_sync_snapshot = _source_sync_snapshot(session, current_user.id, repo)
-    total, commit_rows = _query_commits(
-        since, until, author, repo, limit=None, offset=0, owner_id=current_user.id, session=session
+    prepared = await asyncio.to_thread(
+        _prepare_summary,
+        since=since,
+        until=until,
+        author=author,
+        repo=repo,
+        owner_id=current_user.id,
+        ai=True,
     )
-    _check_ai_preconditions(request, provider, total, user_id=current_user.id)
-
-    by_repo, by_day, repo_commits = _aggregate_commits(commit_rows)
-    log_by_repo = {name: format_log(cs) for name, cs in repo_commits.items()}
-    name_to_id = _repo_name_to_id(session, current_user.id)
-    global_settings = _resolve_settings_dict(session, None, current_user.id)
-    settings_by_repo = {
-        name: _resolve_settings_dict(session, name_to_id.get(name), current_user.id)
-        for name in log_by_repo
-    }
-    resolved = summarizer.resolve_provider(provider)
+    resolved, api_key = await _check_ai_preconditions(
+        request, provider, prepared.total, user_id=current_user.id
+    )
 
     meta = {
         "period": {
             "since": since.isoformat() if since else None,
             "until": until.isoformat() if until else None,
         },
-        "total_commits": total,
-        "by_repo": dict(by_repo),
-        "by_day": dict(sorted(by_day.items())),
-        "source_synced_at": {name: source_sync_snapshot.get(name) for name in by_repo},
-        "repos": list(log_by_repo),
+        "total_commits": prepared.total,
+        "by_repo": prepared.by_repo,
+        "by_day": prepared.by_day,
+        "source_synced_at": {
+            name: prepared.source_synced_at.get(name) for name in prepared.by_repo
+        },
+        "repos": list(prepared.log_by_repo),
         "provider": resolved.name,
         "model": summarizer.display_model(resolved),
     }
 
-    async def event_stream():
+    async def event_stream() -> AsyncIterator[str]:
         yield _sse("meta", meta)
+        if not prepared.log_by_repo:
+            yield _sse("done", {})
+            return
         async with httpx.AsyncClient() as client:
-            for name, log_text in log_by_repo.items():
-                try:
-                    async for chunk in summarizer.stream_summary(
-                        log_text,
-                        provider=provider,
-                        settings=settings_by_repo.get(name, global_settings),
-                        client=client,
-                        user_id=current_user.id,
-                    ):
-                        yield _sse("delta", {"repo": name, "text": chunk})
-                    yield _sse(
-                        "repo_done",
-                        {
-                            "repo": name,
-                            "provider": resolved.name,
-                            "model": summarizer.display_model(resolved),
-                        },
-                    )
-                except (ProviderError, httpx.HTTPError) as e:
-                    log.warning("Stream failed for repo %s: %s", name, e, extra={"repo": name})
-                    yield _sse("repo_error", {"repo": name, "detail": str(e)})
+            try:
+                model = await summarizer.resolve_model(client, resolved, api_key)
+            except ProviderError as exc:
+                log.warning("Summary model discovery failed: %s", exc)
+                for name in prepared.log_by_repo:
+                    yield _sse("repo_error", {"repo": name, "detail": str(exc)})
+                yield _sse("done", {})
+                return
+            queue: asyncio.Queue[tuple[str, dict]] = asyncio.Queue(maxsize=64)
+            sem = asyncio.Semaphore(summarizer._MAX_PARALLEL_SUMMARIES)
+
+            async def produce(name: str, log_text: str) -> None:
+                async with sem:
+                    try:
+                        async for chunk in summarizer.stream_summary(
+                            log_text,
+                            provider=provider,
+                            settings=prepared.settings_by_repo.get(name, prepared.global_settings),
+                            model=model,
+                            client=client,
+                            user_id=current_user.id,
+                            api_key=api_key,
+                        ):
+                            await queue.put(("delta", {"repo": name, "text": chunk}))
+                        terminal = (
+                            "repo_done",
+                            {"repo": name, "provider": resolved.name, "model": model},
+                        )
+                    except (ProviderError, httpx.HTTPError) as exc:
+                        log.warning(
+                            "Stream failed for repo %s: %s", name, exc, extra={"repo": name}
+                        )
+                        terminal = ("repo_error", {"repo": name, "detail": str(exc)})
+                    except Exception:
+                        log.exception("Stream failed unexpectedly for repo %s", name)
+                        terminal = (
+                            "repo_error",
+                            {"repo": name, "detail": "Summary stream failed."},
+                        )
+                    await queue.put(terminal)
+
+            tasks = [
+                asyncio.create_task(produce(name, log_text))
+                for name, log_text in prepared.log_by_repo.items()
+            ]
+            try:
+                remaining = len(tasks)
+                while remaining:
+                    event, data = await queue.get()
+                    yield _sse(event, data)
+                    if event in {"repo_done", "repo_error"}:
+                        remaining -= 1
+            finally:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
         yield _sse("done", {})
 
     return StreamingResponse(
@@ -1938,7 +2107,7 @@ def create_repo(
         metadata={"name": name, "clone_url": req.url},
     )
     _claim_ingest(repo.id)
-    background.add_task(_run_ingest, repo.id, name)
+    _submit_ingest(background, request, repo.id, name)
     return _repo_to_dict(repo)
 
 
@@ -1953,6 +2122,7 @@ def create_repo(
 def ingest_repo(
     repo_id: int,
     background: BackgroundTasks,
+    request: Request,
     session: Session = Depends(get_db),
     current_user: UserRow = Depends(get_current_user),
 ):
@@ -1962,7 +2132,7 @@ def ingest_repo(
         raise HTTPException(status_code=404, detail="Repo not found")
     if not _claim_ingest(repo_id):
         raise HTTPException(status_code=409, detail="Ingest already in progress")
-    background.add_task(_run_ingest, repo_id, repo.name)
+    _submit_ingest(background, request, repo_id, repo.name)
     return {"accepted": True}
 
 

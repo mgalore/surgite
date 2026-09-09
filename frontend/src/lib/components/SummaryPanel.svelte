@@ -9,6 +9,8 @@
 		type Repo,
 		type SummaryParams
 	} from '$lib/api';
+	import { repoFreshness, reposInScope, resultNeedsRefresh, type RepoFreshness } from '$lib/repo-freshness';
+	import { relativeTime } from '$lib/time';
 	import { sortSummaryEntries, type SummaryEntry, type SummaryStatus } from '$lib/summary-view';
 	import { toasts } from '$lib/toast.svelte';
 	import SummaryReader from './SummaryReader.svelte';
@@ -17,11 +19,19 @@
 	let {
 		repos,
 		resultActive = $bindable(false),
-		onOpenRepos
+		onOpenRepos,
+		staleAfterSeconds,
+		syncingIds,
+		onSync,
+		onEditPrompt
 	}: {
 		repos: Repo[];
 		resultActive?: boolean;
 		onOpenRepos?: () => void;
+		staleAfterSeconds: number | null;
+		syncingIds: Set<number>;
+		onSync: (repos: Repo[]) => void;
+		onEditPrompt: (repo: string) => void;
 	} = $props();
 
 	let repoName = $state('');
@@ -57,11 +67,25 @@
 	let isAiResult = $state(false);
 	let lastParams: SummaryParams | null = null;
 	let controller: AbortController | undefined;
+	let refreshController: AbortController | undefined;
+	let refreshingRepo = $state<string | null>(null);
+	let sourceSyncedAt = $state<Record<string, string | null>>({});
 
 	const rangeInvalid = $derived(
 		range === 'custom' && !!customSince && !!customUntil && customSince > customUntil
 	);
 	const hasResult = $derived(stats !== null);
+	const scopedRepos = $derived(reposInScope(repos, repoName));
+	const scopedFreshness = $derived(
+		scopedRepos.map((repo) => ({ repo, freshness: repoFreshness(repo, staleAfterSeconds, syncingIds.has(repo.id)) }))
+	);
+	const attentionRepos = $derived(scopedFreshness.filter(({ freshness }) => freshness.needsAttention).map(({ repo }) => repo));
+	const oldestSuccessfulSync = $derived(
+		scopedRepos
+			.map((repo) => repo.last_ingested_at)
+			.filter((value): value is string => value !== null)
+			.sort()[0] ?? null
+	);
 	const summaryEntries = $derived.by((): SummaryEntry[] => {
 		const currentStats = stats;
 		if (!currentStats) return [];
@@ -73,7 +97,8 @@
 				kind: 'ai',
 				status: summary.status,
 				provider: summary.provider,
-				model: summary.model
+				model: summary.model,
+				sourceSyncedAt: sourceSyncedAt[repo]
 			}));
 		}
 		return Object.entries(logByRepo ?? {}).map(([repo, text]) => ({
@@ -81,8 +106,28 @@
 			commits: currentStats.byRepo[repo] ?? 0,
 			text,
 			kind: 'log',
-			status: 'complete'
+			status: 'complete',
+			sourceSyncedAt: sourceSyncedAt[repo]
 		}));
+	});
+	const freshnessByRepo = $derived.by(() => {
+		const byName: Record<string, Repo> = Object.fromEntries(repos.map((repo) => [repo.name, repo]));
+		return Object.fromEntries(
+			summaryEntries.map((entry) => {
+				const repo = byName[entry.repo];
+				const freshness = repo
+					? repoFreshness(repo, staleAfterSeconds, syncingIds.has(repo.id))
+					: ({ status: 'never', needsAttention: true } satisfies RepoFreshness);
+				return [
+					entry.repo,
+					{
+						...freshness,
+						lastSyncedAt: repo?.last_ingested_at ?? null,
+						resultNeedsRefresh: resultNeedsRefresh(entry.sourceSyncedAt ?? undefined, repo)
+					}
+				];
+			})
+		);
 	});
 
 	const BRAILLE = ['⣾', '⣽', '⣻', '⢿', '⡿', '⣟', '⣯', '⣷'];
@@ -115,7 +160,10 @@
 		}
 	});
 
-	onDestroy(() => controller?.abort());
+	onDestroy(() => {
+		controller?.abort();
+		refreshController?.abort();
+	});
 
 	function sinceDate(days: number): string {
 		const date = new Date();
@@ -168,12 +216,15 @@
 
 	async function generate() {
 		controller?.abort();
+		refreshController?.abort();
+		refreshingRepo = null;
 		controller = new AbortController();
 		generating = true;
 		error = null;
 		stats = null;
 		summaries = {};
 		logByRepo = null;
+		sourceSyncedAt = {};
 		isAiResult = useAi;
 		didFocusResults = false;
 		const params = currentParams();
@@ -184,7 +235,7 @@
 				await streamSummary(
 					params,
 					{
-						onMeta: (meta) => {
+							onMeta: (meta) => {
 							setStats({
 								total: meta.total_commits,
 								byRepo: meta.by_repo,
@@ -197,6 +248,7 @@
 									{ text: '', provider: meta.provider, model: meta.model, status: 'waiting' as const }
 								])
 							);
+							sourceSyncedAt = meta.source_synced_at;
 						},
 						onDelta: (repo, text) => {
 							if (summaries[repo]) {
@@ -229,12 +281,134 @@
 					period: result.period
 				});
 				logByRepo = result.log_by_repo;
+				sourceSyncedAt = result.source_synced_at;
 			}
 		} catch (cause) {
 			if (cause instanceof DOMException && cause.name === 'AbortError') return;
 			error = cause instanceof Error ? cause.message : 'Failed to generate summary';
 		} finally {
 			generating = false;
+		}
+	}
+
+	function applyStats(result: {
+		total_commits: number;
+		by_repo: Record<string, number>;
+		by_day: Record<string, number>;
+		period: { since: string | null; until: string | null };
+	}) {
+		setStats({
+			total: result.total_commits,
+			byRepo: result.by_repo,
+			byDay: result.by_day,
+			period: result.period
+		});
+	}
+
+	function removeResult(repo: string) {
+		const { [repo]: _removedSummary, ...remainingSummaries } = summaries;
+		summaries = remainingSummaries;
+		const { [repo]: _removedLog, ...remainingLogs } = logByRepo ?? {};
+		logByRepo = remainingLogs;
+		const { [repo]: _removedSource, ...remainingSources } = sourceSyncedAt;
+		sourceSyncedAt = remainingSources;
+	}
+
+	function restoreResult(
+		entry: SummaryEntry,
+		previousSummary: RepoSummary | undefined,
+		previousLog: string | undefined,
+		previousSource: string | null | undefined
+	) {
+		if (entry.kind === 'ai' && previousSummary) summaries = { ...summaries, [entry.repo]: previousSummary };
+		if (entry.kind === 'log' && previousLog !== undefined) logByRepo = { ...(logByRepo ?? {}), [entry.repo]: previousLog };
+		if (previousSource !== undefined) sourceSyncedAt = { ...sourceSyncedAt, [entry.repo]: previousSource };
+	}
+
+	async function refreshGlobalStats(signal: AbortSignal) {
+		if (!lastParams) return;
+		try {
+			const result = await generateSummary({ ...lastParams, ai: false }, signal);
+			applyStats(result);
+		} catch (cause) {
+			if (cause instanceof DOMException && cause.name === 'AbortError') throw cause;
+			toasts.error('result refreshed, but global statistics could not be updated');
+		}
+	}
+
+	async function refreshEntry(entry: SummaryEntry) {
+		if (!lastParams || generating || refreshingRepo) return;
+		const repo = repos.find((item) => item.name === entry.repo);
+		if (!repo || syncingIds.has(repo.id)) return;
+		const previousSummary = summaries[entry.repo];
+		const previousLog = logByRepo?.[entry.repo];
+		const previousSource = sourceSyncedAt[entry.repo];
+		const currentController = new AbortController();
+		refreshController = currentController;
+		refreshingRepo = entry.repo;
+		try {
+			if (entry.kind === 'ai') {
+				let found = false;
+				await streamSummary(
+					{ ...lastParams, repo: entry.repo },
+					{
+						onMeta: (meta) => {
+							found = meta.repos.includes(entry.repo);
+							if (!found) {
+								removeResult(entry.repo);
+								toasts.success(`${entry.repo}: no commits remain in this period`);
+								return;
+							}
+							summaries = {
+								...summaries,
+								[entry.repo]: {
+									text: '',
+									provider: meta.provider,
+									model: meta.model,
+									status: 'waiting'
+								}
+							};
+							sourceSyncedAt = { ...sourceSyncedAt, [entry.repo]: meta.source_synced_at[entry.repo] ?? null };
+						},
+						onDelta: (name, text) => {
+							const current = summaries[name];
+							if (current) summaries = { ...summaries, [name]: { ...current, text: current.text + text, status: 'streaming' } };
+						},
+						onRepoDone: (name, provider, model) => {
+							const current = summaries[name];
+							if (current) summaries = { ...summaries, [name]: { ...current, provider, model, status: 'complete' } };
+						},
+						onRepoError: (name, detail) => {
+							const current = summaries[name];
+							if (current) summaries = { ...summaries, [name]: { ...current, text: detail, status: 'error' } };
+						}
+					},
+					currentController.signal
+				);
+				if (!found) {
+					await refreshGlobalStats(currentController.signal);
+					return;
+				}
+			} else {
+				const result = await generateSummary({ ...lastParams, repo: entry.repo, ai: false }, currentController.signal);
+				const text = result.log_by_repo?.[entry.repo];
+				if (text === undefined) {
+					removeResult(entry.repo);
+					toasts.success(`${entry.repo}: no commits remain in this period`);
+				} else {
+					logByRepo = { ...(logByRepo ?? {}), [entry.repo]: text };
+					sourceSyncedAt = { ...sourceSyncedAt, [entry.repo]: result.source_synced_at[entry.repo] ?? null };
+				}
+			}
+			await refreshGlobalStats(currentController.signal);
+		} catch (cause) {
+			if (!(cause instanceof DOMException && cause.name === 'AbortError')) {
+				restoreResult(entry, previousSummary, previousLog, previousSource);
+				toasts.error(cause instanceof Error ? `${entry.repo}: ${cause.message}` : `${entry.repo}: could not refresh result`);
+			}
+		} finally {
+			if (refreshController === currentController) refreshController = undefined;
+			if (refreshingRepo === entry.repo) refreshingRepo = null;
 		}
 	}
 
@@ -310,6 +484,23 @@
 			</button>
 		</div>
 
+		{#if scopedRepos.length}
+			<div class="mt-3 flex flex-wrap items-center gap-3 border border-border bg-surface px-3 py-2 text-xs" aria-live="polite">
+				<p class="min-w-52 flex-1 text-fg-muted">
+					{#if attentionRepos.length}
+						<span class="text-accent">▲</span> <span class="text-fg">{attentionRepos.length} {attentionRepos.length === 1 ? 'repository needs' : 'repositories need'} attention</span> · {scopedFreshness.filter(({ freshness }) => freshness.status === 'current').length} source{scopedFreshness.filter(({ freshness }) => freshness.status === 'current').length === 1 ? '' : 's'} current
+					{:else if staleAfterSeconds === null}
+						<span class="text-ok">✓</span> <span class="text-fg">All sources have successful data</span> · automatic sync is off{oldestSuccessfulSync ? ` · oldest sync ${relativeTime(oldestSuccessfulSync)}` : ''}
+					{:else}
+						<span class="text-ok">✓</span> <span class="text-fg">All repositories in scope are current</span>{oldestSuccessfulSync ? ` · oldest sync ${relativeTime(oldestSuccessfulSync)}` : ''}
+					{/if}
+				</p>
+				{#if attentionRepos.length}
+					<button type="button" onclick={() => onSync(attentionRepos)} class={actionCls}>↻ sync attention</button>
+				{/if}
+			</div>
+		{/if}
+
 		{#if rangeInvalid}<p class="mt-3 text-sm text-err">"From" must be on or before "to".</p>{/if}
 		{#if error}
 			<p class="mt-3 text-sm text-err">{error}</p>
@@ -320,13 +511,23 @@
 				<div class="mt-3 flex flex-wrap items-center justify-between gap-2">
 					<span class="text-xs text-fg-faint">{buildCliEcho()}</span>
 					<div class="flex items-center gap-2">
-						<button onclick={copyMarkdown} disabled={generating} class={actionCls}>❯ copy markdown</button>
+						<button onclick={copyMarkdown} disabled={generating || refreshingRepo !== null} class={actionCls}>❯ copy markdown</button>
 						<button onclick={share} disabled={generating || sharing} class={actionCls}>{sharing ? 'sharing…' : '❯ share link'}</button>
 					</div>
 				</div>
 				<SummaryStats totalCommits={stats.total} byRepo={stats.byRepo} byDay={stats.byDay} period={stats.period} />
 				<h3 bind:this={resultHeading} tabindex="-1" class="mt-4 text-sm font-semibold text-fg">summary results</h3>
-				<SummaryReader entries={summaryEntries} />
+				<SummaryReader
+					entries={summaryEntries}
+					{freshnessByRepo}
+					{refreshingRepo}
+					onSync={(name) => {
+						const repo = repos.find((item) => item.name === name);
+						if (repo) onSync([repo]);
+					}}
+					onRefresh={refreshEntry}
+					onEditPrompt={onEditPrompt}
+				/>
 			{/if}
 		{:else if generating}
 			<p class="mt-4 text-sm text-fg-muted">{spinnerFrame} preparing summary…</p>

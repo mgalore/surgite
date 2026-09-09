@@ -8,7 +8,17 @@
 	import { toasts } from '$lib/toast.svelte';
 	import Skeleton from './Skeleton.svelte';
 
-	let { repos = [], active = false }: { repos?: Repo[]; active?: boolean } = $props();
+	let {
+		repos = [],
+		active = false,
+		requestedRepoId = null,
+		requestVersion = 0
+	}: {
+		repos?: Repo[];
+		active?: boolean;
+		requestedRepoId?: number | null;
+		requestVersion?: number;
+	} = $props();
 
 	let saving = $state(false);
 	let loading = $state(false);
@@ -27,8 +37,10 @@
 	let group_count = $state('2-5');
 	let output_format = $state('markdown');
 	let custom_instructions = $state('');
+	let baseline = $state('');
 
 	const inherited = $derived(selectedRepoId !== null && loadedRepoId === null);
+	const dirty = $derived(loaded && settingsSnapshot() !== baseline);
 
 	const TONES = [
 		{ value: 'neutral', label: 'Neutral' },
@@ -52,6 +64,11 @@
 		group_count = s.group_count;
 		output_format = s.output_format;
 		custom_instructions = s.custom_instructions;
+		baseline = settingsSnapshot();
+	}
+
+	function settingsSnapshot(): string {
+		return JSON.stringify({ user_name, user_role, tone, group_count, output_format, custom_instructions });
 	}
 
 	async function load() {
@@ -68,12 +85,25 @@
 	$effect(() => {
 		if (!active || loaded || loading) return;
 		loaded = true;
+		if (requestVersion > 0) selectedRepoId = requestedRepoId;
 		void load();
 	});
 
-	async function selectRepo(value: string) {
-		selectedRepoId = value === '' ? null : Number(value);
+	$effect(() => {
+		if (!active || !loaded || requestVersion === 0 || requestedRepoId === selectedRepoId) return;
+		void selectRepo(requestedRepoId);
+	});
+
+	async function selectRepo(next: number | null): Promise<boolean> {
+		if (next === selectedRepoId) return true;
+		if (dirty && !window.confirm('Discard unsaved prompt settings changes?')) return false;
+		selectedRepoId = next;
 		await load();
+		return true;
+	}
+
+	async function selectRepoValue(value: string) {
+		await selectRepo(value === '' ? null : Number(value));
 	}
 
 	async function save() {
@@ -109,7 +139,7 @@
 				<select
 					id="ps-scope"
 					value={selectedRepoId === null ? '' : String(selectedRepoId)}
-					onchange={(e) => selectRepo(e.currentTarget.value)}
+					onchange={(e) => selectRepoValue(e.currentTarget.value)}
 					class="border border-border bg-bg px-2 py-1.5 text-sm text-fg"
 				>
 					<option value="">Global default</option>

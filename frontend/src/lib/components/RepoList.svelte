@@ -1,6 +1,5 @@
 <script lang="ts">
-	import { onDestroy } from 'svelte';
-	import { deleteRepo, ingestRepo, listRepos, type Repo } from '$lib/api';
+	import { deleteRepo, type Repo } from '$lib/api';
 	import { relativeTime } from '$lib/time';
 	import { toasts } from '$lib/toast.svelte';
 	import Skeleton from './Skeleton.svelte';
@@ -9,77 +8,19 @@
 		repos,
 		loading,
 		error,
-		onChanged
+		onChanged,
+		syncingIds,
+		onSync
 	}: {
 		repos: Repo[];
 		loading: boolean;
 		error: string | null;
 		onChanged: () => void;
+		syncingIds: Set<number>;
+		onSync: (repos: Repo[]) => void;
 	} = $props();
 
 	let deletingId = $state<number | null>(null);
-	let syncingIds = $state(new Set<number>());
-	const pollControllers = new Map<number, AbortController>();
-
-	function setSyncing(id: number, syncing: boolean) {
-		const next = new Set(syncingIds);
-		if (syncing) next.add(id);
-		else next.delete(id);
-		syncingIds = next;
-	}
-
-	function delay(ms: number, signal: AbortSignal) {
-		return new Promise<void>((resolve) => {
-			const finish = () => {
-				clearTimeout(timer);
-				signal.removeEventListener('abort', finish);
-				resolve();
-			};
-			const timer = setTimeout(finish, ms);
-			signal.addEventListener('abort', finish, { once: true });
-		});
-	}
-
-	async function handleSync(repo: Repo) {
-		const controller = new AbortController();
-		pollControllers.set(repo.id, controller);
-		setSyncing(repo.id, true);
-		try {
-			try {
-				await ingestRepo(repo.id);
-			} catch (e) {
-				if ((e as Error & { status?: number }).status !== 409) throw e;
-			}
-
-			const deadline = Date.now() + 120_000;
-			while (!controller.signal.aborted && Date.now() < deadline) {
-				await delay(2_000, controller.signal);
-				if (controller.signal.aborted) return;
-				const current = (await listRepos(controller.signal)).find((item) => item.id === repo.id);
-				if (!current || current.last_ingest_attempt_at !== repo.last_ingest_attempt_at) {
-					await onChanged();
-					if (current?.last_ingest_error) toasts.error(`${repo.name}: sync failed`);
-					else toasts.success(`synced ${repo.name}`);
-					return;
-				}
-			}
-			if (!controller.signal.aborted) {
-				toasts.error(`${repo.name}: sync continues in the background`);
-			}
-		} catch (e) {
-			if (!controller.signal.aborted) {
-				toasts.error(e instanceof Error ? e.message : 'sync failed');
-			}
-		} finally {
-			pollControllers.delete(repo.id);
-			setSyncing(repo.id, false);
-		}
-	}
-
-	onDestroy(() => {
-		for (const controller of pollControllers.values()) controller.abort();
-		pollControllers.clear();
-	});
 
 	async function handleDelete(id: number) {
 		deletingId = id;
@@ -137,7 +78,7 @@
 					</div>
 					<div class="flex shrink-0 items-center gap-3">
 						<button
-							onclick={() => handleSync(repo)}
+							onclick={() => onSync([repo])}
 							disabled={syncingIds.has(repo.id) || deletingId === repo.id}
 							class="text-base text-fg-faint transition hover:text-accent disabled:opacity-50"
 							aria-label="Sync {repo.name}"

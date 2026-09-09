@@ -15,6 +15,11 @@ export interface Repo {
 	last_ingest_error: string | null;
 }
 
+export interface RepoList {
+	repos: Repo[];
+	stale_after_seconds: number | null;
+}
+
 export interface Commit {
 	hash: string;
 	short_hash: string;
@@ -30,6 +35,7 @@ export interface Summary {
 	total_commits: number;
 	by_repo: Record<string, number>;
 	by_day: Record<string, number>;
+	source_synced_at: Record<string, string | null>;
 	commits: Commit[];
 	log_by_repo: Record<string, string> | null;
 	ai_summary: string | null;
@@ -116,8 +122,7 @@ export const resetPassword = (token: string, newPassword: string) =>
 		body: JSON.stringify({ token, new_password: newPassword })
 	});
 
-export const listRepos = (signal?: AbortSignal) =>
-	request<{ repos: Repo[] }>('/repos', { signal }).then((r) => r.repos);
+export const listRepos = (signal?: AbortSignal) => request<RepoList>('/repos', { signal });
 
 export const addRepo = (url: string) =>
 	request<Repo>('/repos', { method: 'POST', body: JSON.stringify({ url }) });
@@ -285,6 +290,7 @@ export interface StreamMeta {
 	total_commits: number;
 	by_repo: Record<string, number>;
 	by_day: Record<string, number>;
+	source_synced_at: Record<string, string | null>;
 	repos: string[];
 	provider: string;
 	model: string;

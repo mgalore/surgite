@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { listRepos, type Repo } from '$lib/api';
+	import { RepoSyncManager } from '$lib/repo-sync';
 	import AddRepoForm from '$lib/components/AddRepoForm.svelte';
 	import HelpOverlay from '$lib/components/HelpOverlay.svelte';
 	import PromptSettings from '$lib/components/PromptSettings.svelte';
@@ -18,12 +19,21 @@
 	let showHelp = $state(false);
 	let workspace = $state<Workspace>('summary');
 	let resultActive = $state(false);
+	let staleAfterSeconds = $state<number | null>(null);
+	let syncingIds = $state(new Set<number>());
+	let requestedSettingsRepoId = $state<number | null>(null);
+	let settingsRequestVersion = $state(0);
+
+	function applyRepoData(data: { repos: Repo[]; stale_after_seconds: number | null }) {
+		repos = data.repos;
+		staleAfterSeconds = data.stale_after_seconds;
+	}
 
 	async function loadRepos() {
 		loading = true;
 		error = null;
 		try {
-			repos = await listRepos();
+			applyRepoData(await listRepos());
 		} catch (cause) {
 			error = cause instanceof Error ? cause.message : 'Failed to load repos';
 		} finally {
@@ -31,7 +41,12 @@
 		}
 	}
 
-	onMount(loadRepos);
+	const syncManager = new RepoSyncManager(applyRepoData, (next) => (syncingIds = next));
+
+	onMount(() => {
+		void loadRepos();
+		return () => syncManager.destroy();
+	});
 
 	const KONAMI = ['ArrowUp', 'ArrowUp', 'ArrowDown', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'ArrowLeft', 'ArrowRight', 'b', 'a'];
 	let konamiIdx = 0;
@@ -55,6 +70,19 @@
 
 	function openWorkspace(next: Workspace) {
 		workspace = next;
+	}
+
+	function handleRepoAdded(repo: Repo) {
+		void loadRepos();
+		syncManager.trackInitialIngest(repo);
+	}
+
+	function openPromptForRepo(name: string) {
+		const repo = repos.find((item) => item.name === name);
+		if (!repo) return;
+		requestedSettingsRepoId = repo.id;
+		settingsRequestVersion += 1;
+		openWorkspace('settings');
 	}
 
 	function handleWorkspaceKeydown(event: KeyboardEvent, current: Workspace) {
@@ -103,17 +131,25 @@
 		</div>
 
 		<div id="summary-panel" role="tabpanel" aria-labelledby="summary-tab" hidden={workspace !== 'summary'} class="px-4 pb-6 sm:px-6">
-			<SummaryPanel {repos} bind:resultActive onOpenRepos={() => openWorkspace('repositories')} />
+			<SummaryPanel
+				{repos}
+				{staleAfterSeconds}
+				{syncingIds}
+				bind:resultActive
+				onOpenRepos={() => openWorkspace('repositories')}
+				onSync={(targets) => syncManager.sync(targets)}
+				onEditPrompt={openPromptForRepo}
+			/>
 		</div>
 		<div id="repositories-panel" role="tabpanel" aria-labelledby="repositories-tab" hidden={workspace !== 'repositories'} class="px-4 pb-6 sm:px-6">
 			<div class="max-w-2xl">
 				<h2 class="text-sm text-fg-muted"><span class="text-accent">~/repos</span> <span aria-hidden="true">❯</span></h2>
-				<AddRepoForm onAdded={loadRepos} />
-				<RepoList {repos} {loading} {error} onChanged={loadRepos} />
+				<AddRepoForm onAdded={handleRepoAdded} />
+				<RepoList {repos} {loading} {error} onChanged={loadRepos} {syncingIds} onSync={(targets) => syncManager.sync(targets)} />
 			</div>
 		</div>
 		<div id="settings-panel" role="tabpanel" aria-labelledby="settings-tab" hidden={workspace !== 'settings'} class="px-4 pb-6 sm:px-6">
-			<div class="max-w-2xl"><PromptSettings {repos} active={workspace === 'settings'} /></div>
+			<div class="max-w-2xl"><PromptSettings {repos} active={workspace === 'settings'} requestedRepoId={requestedSettingsRepoId} requestVersion={settingsRequestVersion} /></div>
 		</div>
 	</div>
 </main>

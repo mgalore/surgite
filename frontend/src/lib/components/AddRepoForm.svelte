@@ -2,7 +2,9 @@
 	import { addRepo } from '$lib/api';
 	import { toasts } from '$lib/toast.svelte';
 
-	let { onAdded }: { onAdded: () => void } = $props();
+	import type { Repo } from '$lib/api';
+
+	let { onAdded }: { onAdded: (repo: Repo) => void } = $props();
 
 	function focusOnMount(node: HTMLInputElement) {
 		node.focus();
@@ -24,7 +26,7 @@
 			input = '';
 			open = false;
 			toasts.success(`added ${repo.name}`);
-			onAdded();
+			onAdded(repo);
 		} catch (e2) {
 			error = e2 instanceof Error ? e2.message : 'failed to add repo';
 			submitting = false;

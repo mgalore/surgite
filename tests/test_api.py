@@ -1,5 +1,5 @@
 import io
-from datetime import date
+from datetime import UTC, date, datetime
 
 import pytest
 
@@ -114,6 +114,16 @@ def test_summary_by_day_is_chronologically_sorted(client, add_commit):
     ]
 
 
+def test_summary_includes_the_source_sync_snapshot(client, add_repo, add_commit):
+    synced_at = datetime(2026, 5, 19, 12, 0, tzinfo=UTC)
+    repo_id = add_repo(name="demo", last_ingested_at=synced_at)
+    add_commit(repo_id=repo_id, repo="demo")
+
+    body = client.get("/summary?repo=demo").json()
+
+    assert body["source_synced_at"]["demo"].startswith("2026-05-19T12:00:00")
+
+
 def test_summary_ai_without_key_returns_400(client):
     r = client.get("/summary?ai=true")
     assert r.status_code == 400
@@ -193,7 +203,12 @@ def test_summary_ai_without_key_returns_400_even_with_no_commits(client):
 def test_list_repos_empty(client):
     r = client.get("/repos")
     assert r.status_code == 200
-    assert r.json() == {"repos": []}
+    assert r.json() == {"repos": [], "stale_after_seconds": None}
+
+
+def test_list_repos_exposes_the_scheduler_derived_stale_window(client, monkeypatch):
+    monkeypatch.setenv("INGEST_INTERVAL", "45")
+    assert client.get("/repos").json()["stale_after_seconds"] == 90
 
 
 def test_create_repo_returns_201(client):
@@ -583,6 +598,7 @@ def test_summary_stream_emits_meta_deltas_and_done(client, add_commit, monkeypat
     assert "text/event-stream" in r.headers["content-type"]
     text = r.text
     assert "event: meta" in text
+    assert '"source_synced_at"' in text
     assert "event: delta" in text
     assert "Hello " in text and "world" in text
     assert "event: repo_done" in text

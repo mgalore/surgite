@@ -98,6 +98,15 @@ _active_ingests: set[int] = set()
 _active_ingests_lock = threading.Lock()
 
 
+def _ingest_interval_seconds() -> int:
+    """Return the scheduler interval from the current process environment.
+
+    Keeping this in one place lets the scheduler and the UI's freshness window
+    agree, while retaining the test-friendly startup-time environment lookup.
+    """
+    return int(os.environ.get("INGEST_INTERVAL", "300"))
+
+
 def _claim_ingest(repo_id: int) -> bool:
     """Atomically reserve a repo for ingestion in this process."""
     with _active_ingests_lock:
@@ -297,7 +306,7 @@ async def _lifespan(app: FastAPI):
                 token,
             )
 
-    interval = int(os.environ.get("INGEST_INTERVAL", "300"))
+    interval = _ingest_interval_seconds()
     task: asyncio.Task | None = None
     if interval > 0:
         task = asyncio.create_task(_scheduler_loop(interval))
@@ -1614,6 +1623,24 @@ def _aggregate_commits(
     return by_repo, by_day, repo_commits
 
 
+def _source_sync_snapshot(
+    session: Session, owner_id: str, repo: str | None
+) -> dict[str, str | None]:
+    """Capture repository ingest times before reading commits.
+
+    A concurrent ingest can only make this conservative: the UI may ask for a
+    refresh unnecessarily, but it never presents a summary as having used a
+    source snapshot newer than its commit query.
+    """
+    query = select(RepoRow).where(RepoRow.owner_id == owner_id)
+    if repo is not None:
+        query = query.where(RepoRow.name == repo)
+    return {
+        row.name: row.last_ingested_at.isoformat() if row.last_ingested_at else None
+        for row in session.scalars(query).all()
+    }
+
+
 def _repo_name_to_id(session: Session, owner_id: str) -> dict[str, int]:
     return {
         r.name: r.id
@@ -1682,6 +1709,7 @@ async def summary(
     This is a pure read against the DB; freshness is owned by the background
     ingest scheduler (see _scheduler_loop) and the per-repo BackgroundTask
     on POST /repos. No git fetch happens here."""
+    source_sync_snapshot = _source_sync_snapshot(session, current_user.id, repo)
     total, commit_rows = _query_commits(
         since, until, author, repo, limit=None, offset=0, owner_id=current_user.id, session=session
     )
@@ -1732,6 +1760,7 @@ async def summary(
         "total_commits": total,
         "by_repo": dict(by_repo),
         "by_day": dict(sorted(by_day.items())),
+        "source_synced_at": {name: source_sync_snapshot.get(name) for name in by_repo},
         "commits": commit_rows if commits else [],
         "log_by_repo": log_by_repo,
         "ai_summary": ai_summary,
@@ -1770,6 +1799,7 @@ async def summary_stream(
     All DB reads happen up front: the StreamingResponse generator runs after
     the request handler returns and the Depends-injected session is closed, so
     it must only touch the provider, never the DB."""
+    source_sync_snapshot = _source_sync_snapshot(session, current_user.id, repo)
     total, commit_rows = _query_commits(
         since, until, author, repo, limit=None, offset=0, owner_id=current_user.id, session=session
     )
@@ -1793,6 +1823,7 @@ async def summary_stream(
         "total_commits": total,
         "by_repo": dict(by_repo),
         "by_day": dict(sorted(by_day.items())),
+        "source_synced_at": {name: source_sync_snapshot.get(name) for name in by_repo},
         "repos": list(log_by_repo),
         "provider": resolved.name,
         "model": summarizer.display_model(resolved),
@@ -1844,7 +1875,11 @@ def list_repos(
 ):
     """List the repos the caller has registered, with ingest timestamps."""
     rows = session.scalars(select(RepoRow).where(RepoRow.owner_id == current_user.id)).all()
-    return {"repos": [_repo_to_dict(r) for r in rows]}
+    interval = _ingest_interval_seconds()
+    return {
+        "repos": [_repo_to_dict(r) for r in rows],
+        "stale_after_seconds": interval * 2 if interval > 0 else None,
+    }
 
 
 @app.post(

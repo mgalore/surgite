@@ -11,9 +11,27 @@
 		type SummaryEntry,
 		type SummaryLayout
 	} from '$lib/summary-view';
+	import type { RepoFreshness } from '$lib/repo-freshness';
+	import { relativeTime } from '$lib/time';
 	import { toasts } from '$lib/toast.svelte';
 
-	let { entries }: { entries: SummaryEntry[] } = $props();
+	type ReaderFreshness = RepoFreshness & { resultNeedsRefresh: boolean; lastSyncedAt: string | null };
+
+	let {
+		entries,
+		freshnessByRepo = {},
+		refreshingRepo = null,
+		onSync,
+		onRefresh,
+		onEditPrompt
+	}: {
+		entries: SummaryEntry[];
+		freshnessByRepo?: Record<string, ReaderFreshness>;
+		refreshingRepo?: string | null;
+		onSync?: (repo: string) => void;
+		onRefresh?: (entry: SummaryEntry) => void;
+		onEditPrompt?: (repo: string) => void;
+	} = $props();
 
 	let layout = $state<SummaryLayout>('focus');
 	let selectedRepo = $state<string | null>(null);
@@ -80,6 +98,36 @@
 		return '✓';
 	}
 
+	function freshness(entry: SummaryEntry): ReaderFreshness | undefined {
+		return freshnessByRepo[entry.repo];
+	}
+
+	function freshnessLabel(entry: SummaryEntry): string {
+		const current = freshness(entry);
+		if (!current) return '';
+		if (current.status === 'syncing') return 'source syncing';
+		if (current.status === 'failed') return current.lastSyncedAt ? `source sync failed · last good ${relativeTime(current.lastSyncedAt)}` : 'source sync failed';
+		if (current.status === 'never') return 'source never synced';
+		if (current.status === 'stale') return current.lastSyncedAt ? `source needs sync · last synced ${relativeTime(current.lastSyncedAt)}` : 'source needs sync';
+		if (current.resultNeedsRefresh) return 'source updated — refresh result';
+		return current.lastSyncedAt ? `source synced ${relativeTime(current.lastSyncedAt)}` : 'source current';
+	}
+
+	function freshnessIcon(entry: SummaryEntry): string {
+		const status = freshness(entry)?.status;
+		if (status === 'failed') return '×';
+		if (status === 'syncing') return '◌';
+		if (status === 'never' || status === 'stale') return '▲';
+		return '✓';
+	}
+
+	function freshnessClass(entry: SummaryEntry): string {
+		const status = freshness(entry)?.status;
+		if (status === 'failed') return 'text-err';
+		if (status === 'syncing' || status === 'never' || status === 'stale') return 'text-accent';
+		return 'text-ok';
+	}
+
 	function hasUsableText(entry: SummaryEntry): boolean {
 		return entry.status !== 'waiting' && entry.status !== 'error' && entry.text.trim().length > 0;
 	}
@@ -105,6 +153,11 @@
 	function openEntry(repo: string) {
 		selectRepo(repo);
 		setLayout('focus');
+	}
+
+	function refreshLabel(entry: SummaryEntry): string {
+		if (refreshingRepo === entry.repo) return entry.kind === 'ai' ? 'regenerating…' : 'refreshing…';
+		return entry.kind === 'ai' ? '◌ regenerate' : '↻ refresh log';
 	}
 </script>
 
@@ -154,6 +207,9 @@
 							<span class="truncate">{entry.repo}</span>
 						</span>
 						<span class="text-fg-faint">{entry.commits} commit{entry.commits === 1 ? '' : 's'} · {statusLabel(entry)}</span>
+						{#if freshness(entry)}
+							<span class="text-fg-faint"><span class={freshnessClass(entry)}>{freshnessIcon(entry)}</span> {freshnessLabel(entry)}</span>
+						{/if}
 					</button>
 				{/each}
 			</nav>
@@ -178,8 +234,34 @@
 								· {activeEntry.provider}{activeEntry.model ? ` · ${activeEntry.model}` : ''}
 							{/if}
 						</p>
+						{#if freshness(activeEntry)}
+							<p class="mt-0.5 text-xs {freshnessClass(activeEntry)}">{freshnessIcon(activeEntry)} {freshnessLabel(activeEntry)}</p>
+						{/if}
 					</div>
 					<div class="flex shrink-0 items-center gap-1">
+						{#if onSync}
+							<button
+								type="button"
+								onclick={() => onSync?.(activeEntry.repo)}
+								disabled={freshness(activeEntry)?.status === 'syncing'}
+								class="px-1.5 py-1 text-xs text-fg-muted transition hover:bg-surface hover:text-fg disabled:opacity-40"
+							>
+								{freshness(activeEntry)?.status === 'failed' ? '↻ retry sync' : '↻ sync'}
+							</button>
+						{/if}
+						{#if onRefresh}
+							<button
+								type="button"
+								onclick={() => onRefresh?.(activeEntry)}
+								disabled={refreshingRepo !== null || freshness(activeEntry)?.status === 'syncing'}
+								class="px-1.5 py-1 text-xs text-fg-muted transition hover:bg-surface hover:text-fg disabled:opacity-40"
+							>
+								{refreshLabel(activeEntry)}
+							</button>
+						{/if}
+						{#if onEditPrompt && activeEntry.kind === 'ai'}
+							<button type="button" onclick={() => onEditPrompt?.(activeEntry.repo)} class="px-1.5 py-1 text-xs text-fg-muted transition hover:bg-surface hover:text-fg">edit prompt</button>
+						{/if}
 						<button
 							type="button"
 							onclick={() => copy(activeEntry)}
@@ -226,6 +308,9 @@
 						<div class="min-w-0">
 							<h3 class="truncate text-sm font-semibold text-fg">{entry.repo}</h3>
 							<p class="mt-0.5 text-xs text-fg-muted">{entry.commits} commit{entry.commits === 1 ? '' : 's'} · {statusLabel(entry)}</p>
+							{#if freshness(entry)}
+								<p class="mt-0.5 text-xs {freshnessClass(entry)}">{freshnessIcon(entry)} {freshnessLabel(entry)}</p>
+							{/if}
 						</div>
 						<span class={entry.status === 'error' ? 'text-err' : entry.status === 'complete' ? 'text-ok' : 'text-accent'} aria-label={statusLabel(entry)}>{statusIcon(entry)}</span>
 					</header>

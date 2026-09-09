@@ -10,6 +10,7 @@ export interface SummaryEntry {
 	status: SummaryStatus;
 	provider?: string;
 	model?: string;
+	sourceSyncedAt?: string | null;
 }
 
 export function sortSummaryEntries(entries: SummaryEntry[]): SummaryEntry[] {

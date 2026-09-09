@@ -29,6 +29,9 @@ class RepoResponse(BaseModel):
 
 class RepoListResponse(BaseModel):
     repos: list[RepoResponse]
+    # The client uses this scheduler-derived window to label old successful
+    # ingests without baking an operator-specific interval into the UI.
+    stale_after_seconds: int | None
 
 
 class IngestAccepted(BaseModel):

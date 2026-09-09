@@ -316,10 +316,22 @@
             },
             "title": "Repos",
             "type": "array"
+          },
+          "stale_after_seconds": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stale After Seconds"
           }
         },
         "required": [
-          "repos"
+          "repos",
+          "stale_after_seconds"
         ],
         "title": "RepoListResponse",
         "type": "object"

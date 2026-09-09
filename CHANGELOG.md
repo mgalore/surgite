@@ -5,6 +5,17 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Repository sync uses metadata-only Git clones and bounded concurrent workers
+  (`INGEST_CONCURRENCY`, default 4). `GIT_TIMEOUT_SECONDS` defaults to 120.
+- Commit identity is now repository-local, so a hash shared by a fork and its
+  upstream is retained and counted in both repositories. Existing rows are
+  preserved; associations that were lost under the old global identity recover
+  on a later sync within the configured ingest window.
+
 ## [1.5.0] - 2026-09-08
 
 ### Added

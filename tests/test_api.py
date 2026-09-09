@@ -2,8 +2,12 @@ import io
 from datetime import UTC, date, datetime
 
 import pytest
+from fastapi import HTTPException
 
+from surgite import api
+from surgite.auth import ensure_bootstrap_user
 from surgite.cli import main
+from surgite.db import get_session
 
 
 @pytest.fixture(autouse=True)
@@ -93,6 +97,37 @@ def test_commit_ambiguous_prefix_returns_409(client, add_commit):
     assert len(r.json()["detail"]["candidates"]) == 2
 
 
+def test_commit_lookup_scopes_shared_hash_to_requested_repo(add_repo, add_commit):
+    first = add_repo(name="upstream", clone_url="https://example.com/upstream.git")
+    second = add_repo(name="fork", clone_url="https://example.com/fork.git")
+    shared_hash = "b" * 40
+    add_commit(repo_id=first, repo="upstream", hash=shared_hash, short_hash="b" * 7)
+    add_commit(repo_id=second, repo="fork", hash=shared_hash, short_hash="b" * 7)
+
+    with get_session() as session:
+        user = ensure_bootstrap_user(session)
+        assert (
+            api.get_commit(shared_hash[:7], repo="fork", session=session, current_user=user)["repo"]
+            == "fork"
+        )
+        assert (
+            api.get_commit(shared_hash[:7], session=session, current_user=user)["repo"]
+            == "upstream"
+        )
+
+
+def test_summary_preparation_rejects_more_than_500_ai_commits(add_commit):
+    for number in range(501):
+        add_commit(hash=f"{number:040x}", short_hash=f"{number:07x}")
+    with get_session() as session:
+        user = ensure_bootstrap_user(session)
+    with pytest.raises(HTTPException, match="Too many commits") as exc:
+        api._prepare_summary(
+            since=None, until=None, author=None, repo=None, owner_id=user.id, ai=True
+        )
+    assert exc.value.status_code == 413
+
+
 def test_summary_counts_all_matching_commits(client, add_commit):
     """Regression: /summary used to inherit list_commits' default limit=50,
     so by_repo/by_day undercounted whenever total > 50."""
@@ -144,7 +179,9 @@ def test_summary_ai_unknown_provider_returns_400(client, add_commit):
 
 
 def _fake_generate(calls):
-    async def fake(commit_log, provider=None, model=None, settings=None, client=None, user_id=None):
+    async def fake(
+        commit_log, provider=None, model=None, settings=None, client=None, user_id=None, **kwargs
+    ):
         calls.append(commit_log)
         return {"summary": "## Features\n- shipped it", "provider": "groq", "model": "x"}
 
@@ -588,7 +625,9 @@ def test_summary_stream_emits_meta_deltas_and_done(client, add_commit, monkeypat
     monkeypatch.setenv("GROQ_API_KEY", "gsk_test")
     from surgite import summarizer
 
-    async def fake_stream(log_text, provider=None, settings=None, client=None, user_id=None):
+    async def fake_stream(
+        log_text, provider=None, settings=None, client=None, user_id=None, **kwargs
+    ):
         yield "Hello "
         yield "world"
 

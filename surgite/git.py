@@ -30,7 +30,7 @@ def _repo_name_from_url(url: str) -> str:
     return name
 
 
-def ensure_repo(name: str, url: str, cache_dir: str) -> str:
+def ensure_repo(name: str, url: str, cache_dir: str, timeout: int = 120) -> str:
     """Ensure a remote repo is cloned. Returns the local path.
 
     Clones with ``--filter=blob:none``: the full commit history arrives, but
@@ -52,6 +52,7 @@ def ensure_repo(name: str, url: str, cache_dir: str) -> str:
             capture_output=True,
             text=True,
             check=True,
+            timeout=timeout,
         )
         # `git fetch` does not update origin/HEAD, so a repo that renamed its
         # default branch (master -> main) would keep resolving to the old one.
@@ -63,20 +64,23 @@ def ensure_repo(name: str, url: str, cache_dir: str) -> str:
             cwd=dest,
             capture_output=True,
             text=True,
+            timeout=timeout,
         )
         subprocess.run(
-            ["git", "reset", "--hard", "origin/HEAD"],
+            ["git", "reset", "--soft", "origin/HEAD"],
             cwd=dest,
             capture_output=True,
             text=True,
             check=True,
+            timeout=timeout,
         )
     else:
         subprocess.run(
-            ["git", "clone", "--filter=blob:none", url, dest],
+            ["git", "clone", "--filter=blob:none", "--no-checkout", url, dest],
             capture_output=True,
             text=True,
             check=True,
+            timeout=timeout,
         )
     return dest
 
@@ -98,9 +102,12 @@ def ls_remote(url: str, timeout: int = 10) -> None:
         raise RuntimeError(result.stderr.strip() or "git ls-remote failed")
 
 
-def _is_git_ref(repo_path: str, value: str) -> bool:
+def _is_git_ref(repo_path: str, value: str, timeout: int = 120) -> bool:
     result = subprocess.run(
-        ["git", "rev-parse", "--verify", "--quiet", value], capture_output=True, cwd=repo_path
+        ["git", "rev-parse", "--verify", "--quiet", value],
+        capture_output=True,
+        cwd=repo_path,
+        timeout=timeout,
     )
     return result.returncode == 0
 
@@ -111,6 +118,7 @@ def get_raw_log(
     until: str,
     author: str | None = None,
     since_commit: str | None = None,
+    timeout: int = 120,
 ) -> str:
     """
     args: repo_path, since, until, author, since_commit
@@ -119,7 +127,7 @@ def get_raw_log(
     """
     cmd = ["git", "log", "--pretty=format:%H\x1f%ad\x1f%an\x1f%s", "--date=short"]
 
-    until_is_ref = _is_git_ref(repo_path, until)
+    until_is_ref = _is_git_ref(repo_path, until, timeout)
 
     if since_commit:
         if until_is_ref:
@@ -143,6 +151,7 @@ def get_raw_log(
         text=True,  # necessary to get a usable output
         capture_output=True,
         cwd=repo_path,  # Without this, git log runs in whatever directory you're in
+        timeout=timeout,
     )
     if result.returncode != 0:
         raise RuntimeError(result.stderr)

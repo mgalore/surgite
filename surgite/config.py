@@ -28,6 +28,7 @@ LOG_FORMAT = os.environ.get("LOG_FORMAT", "")  # "json" enables JSON logs; defau
 # Set to 0 (or any non-positive value) to disable the scheduler — useful
 # for one-off test runs where the lifespan can't actually start a task.
 INGEST_INTERVAL = int(os.environ.get("INGEST_INTERVAL", "300"))
+GIT_TIMEOUT_SECONDS = int(os.environ.get("GIT_TIMEOUT_SECONDS", "120"))
 # Lifetime of a shared-summary slug (the /s/<slug> links).
 SHARE_TTL_DAYS = int(os.environ.get("SHARE_TTL_DAYS", "7"))
 # Summary provider keys (ANTHROPIC_API_KEY / GROQ_API_KEY / DEEPSEEK_API_KEY)

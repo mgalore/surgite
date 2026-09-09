@@ -61,6 +61,10 @@ services:
       SURGITE_ROLE: ${SURGITE_ROLE:-}
       API_HOST: 0.0.0.0
       API_PORT: 8000
+      # Repository sync workers. Set to 1 to process repositories serially.
+      INGEST_CONCURRENCY: ${INGEST_CONCURRENCY:-4}
+      # Upper bound for each clone, fetch, or log subprocess.
+      GIT_TIMEOUT_SECONDS: ${GIT_TIMEOUT_SECONDS:-120}
     volumes:
       - surgite-repos:/var/surgite/repos
       - surgite-data:/var/surgite/data

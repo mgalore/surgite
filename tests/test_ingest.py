@@ -6,7 +6,9 @@ freshness is now owned by the FastAPI lifespan scheduler, and /summary is
 a pure read against the DB. These tests pin that contract.
 """
 
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 
 import pytest
@@ -29,7 +31,7 @@ def fake_git(monkeypatch):
     rec = Recorder()
     monkeypatch.setattr(
         "surgite.git.ensure_repo",
-        lambda name, url, cache: rec.ensured.append(name) or f"/fake/{name}",
+        lambda name, url, cache, timeout=120: rec.ensured.append(name) or f"/fake/{name}",
     )
 
     def fake_get_raw_log(*a, **kw):
@@ -81,6 +83,47 @@ def test_ingest_all_repos_visits_every_registered_repo(add_repo, fake_git):
     assert "inserted" in by_name["a"]
     assert "inserted" in by_name["b"] or "updated" in by_name["b"]
     assert sorted(fake_git.ensured) == ["a", "b"]
+
+
+def test_ingest_keeps_shared_commit_for_each_repository(add_repo, fake_git):
+    first = add_repo(name="upstream", clone_url="https://example.com/upstream.git")
+    second = add_repo(name="fork", clone_url="https://example.com/fork.git")
+    fake_git.commits = make_commits(1)
+
+    results = api._ingest_all_repos()
+
+    assert {result["repo"] for result in results} == {"upstream", "fork"}
+    with get_session() as s:
+        rows = s.query(CommitRow).filter(CommitRow.hash == fake_git.commits[0].hash).all()
+    assert {row.repo_id for row in rows} == {first, second}
+
+
+def test_ingest_all_repos_runs_jobs_concurrently(add_repo, monkeypatch):
+    add_repo(name="a", clone_url="https://example.com/a.git")
+    add_repo(name="b", clone_url="https://example.com/b.git")
+    started = threading.Event()
+    lock = threading.Lock()
+    running = 0
+    peak = 0
+
+    def fake_run(repo_id, fallback_name=None):
+        nonlocal running, peak
+        with lock:
+            running += 1
+            peak = max(peak, running)
+            if running == 2:
+                started.set()
+        assert started.wait(1)
+        with lock:
+            running -= 1
+        api._release_ingest(repo_id)
+        return {"repo": fallback_name}
+
+    monkeypatch.setattr(api, "_run_ingest", fake_run)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        api._ingest_all_repos(executor)
+
+    assert peak == 2
 
 
 def test_ingest_all_repos_handles_empty_registry(add_repo, fake_git):

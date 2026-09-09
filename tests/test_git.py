@@ -114,6 +114,7 @@ def test_ensure_repo_clones_a_repo_with_no_recent_commits(tmp_path, monkeypatch)
     dest = ensure_repo("dormant", f"file://{origin}", str(tmp_path / "cache"))
 
     assert Path(dest, ".git").is_dir()
+    assert not Path(dest, "f.txt").exists()
     assert "ancient commit" in get_raw_log(dest, "1970-01-01", "now")
 
 

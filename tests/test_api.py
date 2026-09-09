@@ -648,6 +648,41 @@ def test_summary_stream_without_key_returns_400(client):
     assert client.get("/summary/stream?provider=groq").status_code == 400
 
 
+def test_summary_stream_model_discovery_error_finishes(client, add_commit, monkeypatch):
+    add_commit()
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_test")
+    from surgite import summarizer
+
+    async def fail_discovery(*args):
+        raise summarizer.ProviderError("choose a model")
+
+    monkeypatch.setattr(summarizer, "resolve_model", fail_discovery)
+    text = client.get("/summary/stream?provider=groq").text
+
+    assert "event: meta" in text
+    assert "event: repo_error" in text
+    assert "choose a model" in text
+    assert text.count("event: done") == 1
+
+
+def test_summary_stream_unexpected_producer_error_finishes(client, add_commit, monkeypatch):
+    add_commit()
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_test")
+    from surgite import summarizer
+
+    async def fail_stream(*args, **kwargs):
+        raise RuntimeError("secret provider failure")
+        yield
+
+    monkeypatch.setattr(summarizer, "stream_summary", fail_stream)
+    text = client.get("/summary/stream?provider=groq").text
+
+    assert "event: repo_error" in text
+    assert "Summary stream failed." in text
+    assert "secret provider failure" not in text
+    assert text.count("event: done") == 1
+
+
 # --- item 8: CLI --registered -----------------------------------------------
 
 

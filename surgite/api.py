@@ -338,6 +338,8 @@ async def _lifespan(app: FastAPI):
         # Shutdown is only reached during application teardown. Waiting here
         # lets in-flight Git subprocesses finish within their own timeout.
         executor.shutdown(wait=True, cancel_futures=True)
+        if getattr(app.state, "ingest_executor", None) is executor:
+            app.state.ingest_executor = None
 
 
 async def _await_ingest(future: Future[dict]) -> None:
@@ -1964,7 +1966,14 @@ async def summary_stream(
             yield _sse("done", {})
             return
         async with httpx.AsyncClient() as client:
-            model = await summarizer.resolve_model(client, resolved, api_key)
+            try:
+                model = await summarizer.resolve_model(client, resolved, api_key)
+            except ProviderError as exc:
+                log.warning("Summary model discovery failed: %s", exc)
+                for name in prepared.log_by_repo:
+                    yield _sse("repo_error", {"repo": name, "detail": str(exc)})
+                yield _sse("done", {})
+                return
             queue: asyncio.Queue[tuple[str, dict]] = asyncio.Queue(maxsize=64)
             sem = asyncio.Semaphore(summarizer._MAX_PARALLEL_SUMMARIES)
 
@@ -1981,14 +1990,22 @@ async def summary_stream(
                             api_key=api_key,
                         ):
                             await queue.put(("delta", {"repo": name, "text": chunk}))
-                        await queue.put(
-                            ("repo_done", {"repo": name, "provider": resolved.name, "model": model})
+                        terminal = (
+                            "repo_done",
+                            {"repo": name, "provider": resolved.name, "model": model},
                         )
                     except (ProviderError, httpx.HTTPError) as exc:
                         log.warning(
                             "Stream failed for repo %s: %s", name, exc, extra={"repo": name}
                         )
-                        await queue.put(("repo_error", {"repo": name, "detail": str(exc)}))
+                        terminal = ("repo_error", {"repo": name, "detail": str(exc)})
+                    except Exception:
+                        log.exception("Stream failed unexpectedly for repo %s", name)
+                        terminal = (
+                            "repo_error",
+                            {"repo": name, "detail": "Summary stream failed."},
+                        )
+                    await queue.put(terminal)
 
             tasks = [
                 asyncio.create_task(produce(name, log_text))

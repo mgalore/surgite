@@ -251,6 +251,15 @@ def test_summary_does_not_call_ingest(client, monkeypatch):
 # --- background scheduler: runs on a timer, can be cancelled ----------------
 
 
+async def test_lifespan_clears_ingest_executor(monkeypatch):
+    monkeypatch.setenv("INGEST_INTERVAL", "0")
+
+    async with api._lifespan(api.app):
+        assert api.app.state.ingest_executor is not None
+
+    assert api.app.state.ingest_executor is None
+
+
 def test_scheduler_runs_periodically(client_with_scheduler, add_repo, fake_git):
     """With INGEST_INTERVAL=1 and one registered repo, the scheduler should
     call _ingest_all_repos at least twice within ~2.5 seconds (initial

@@ -281,6 +281,28 @@ async def test_per_repo_provider_error_is_captured_not_raised():
     assert out["repo-a"]["summary"].startswith("Error:")
 
 
+async def test_per_repo_shared_model_discovery_error_is_captured_once(monkeypatch):
+    calls = 0
+
+    async def fail_discovery(*args):
+        nonlocal calls
+        calls += 1
+        raise ProviderError("choose a local model")
+
+    monkeypatch.setattr(summarizer, "resolve_model", fail_discovery)
+    out = await generate_summary_per_repo(
+        {"repo-a": "log-a", "repo-b": "log-b"},
+        provider="local",
+        api_key="local-test-key",
+    )
+
+    assert calls == 1
+    assert [result["summary"] for result in out.values()] == [
+        "Error: choose a local model",
+        "Error: choose a local model",
+    ]
+
+
 async def test_per_repo_success(monkeypatch):
     monkeypatch.setenv("GROQ_API_KEY", "gsk_test")
 

@@ -478,6 +478,10 @@ async def generate_summary_per_repo(
         sem = asyncio.Semaphore(_MAX_PARALLEL_SUMMARIES)
         chosen_model: str | None = None
 
+        def failure(exc: ProviderError | httpx.HTTPError) -> dict[str, str]:
+            prefix = "Error" if isinstance(exc, ProviderError) else "Provider request failed"
+            return {"summary": f"{prefix}: {exc}", "provider": "", "model": ""}
+
         async def summarize(client: httpx.AsyncClient, name: str, log_text: str) -> dict[str, str]:
             async with sem:
                 try:
@@ -498,22 +502,24 @@ async def generate_summary_per_repo(
                         user_id=user_id,
                         api_key=api_key,
                     )
-                except ProviderError as e:
-                    return {"summary": f"Error: {e}", "provider": "", "model": ""}
-                except httpx.HTTPError as e:
-                    return {"summary": f"Provider request failed: {e}", "provider": "", "model": ""}
+                except (ProviderError, httpx.HTTPError) as exc:
+                    return failure(exc)
 
         async with httpx.AsyncClient() as client:
             # API callers pass the key once per request, which also lets this
             # path discover a local model once before fan-out. Preserve the
             # public helper's per-repository error capture when called alone.
-            if api_key is not None or model is not None:
-                resolved = resolve_provider(provider)
-                resolved_key = api_key or _resolve_key(resolved, user_id)
-                chosen_model = model or await resolve_model(client, resolved, resolved_key)
-            results = await asyncio.gather(
-                *(summarize(client, name, log) for name, log in pending.items())
-            )
+            try:
+                if api_key is not None or model is not None:
+                    resolved = resolve_provider(provider)
+                    resolved_key = api_key or _resolve_key(resolved, user_id)
+                    chosen_model = model or await resolve_model(client, resolved, resolved_key)
+            except ProviderError as exc:
+                results = [failure(exc) for _ in pending]
+            else:
+                results = await asyncio.gather(
+                    *(summarize(client, name, log) for name, log in pending.items())
+                )
         summaries = dict(zip(pending, results, strict=True))
 
     empty = {"summary": "No commits in this period.", "provider": "", "model": ""}

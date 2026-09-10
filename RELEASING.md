@@ -34,7 +34,7 @@ locally; move it to a branch rather than trying to force it through.
 7. Move the `[Unreleased]` entries in `CHANGELOG.md` under the new version,
    with a date.
 8. For a minor or major bump, roll the supported-versions table in
-   [`docs/security-support.md`](docs/security-support.md) forward: the new
+   [`SECURITY.md`](SECURITY.md) forward: the new
    version becomes the latest minor, the one it replaces moves into the
    6-month window, and the one below that goes end-of-life.
 9. If the release changes the install story (the first PyPI release, a

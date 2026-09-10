@@ -1,0 +1,156 @@
+<script lang="ts">
+	// Per-user provider keys. A thin renderer over ProviderKeysStore — the
+	// decisions live there so they're testable without a DOM.
+	//
+	// The raw key exists in exactly two places: the password input below, and
+	// the request body in setProviderKey. It is never rendered back, logged, or
+	// stored — the API never returns it, and nothing here would have it to show.
+	import { ProviderKeysStore } from '$lib/provider-keys.svelte';
+	import { relativeTime } from '$lib/time';
+	import { toasts } from '$lib/toast.svelte';
+	import Skeleton from './Skeleton.svelte';
+
+	let { active = false }: { active?: boolean } = $props();
+
+	const store = new ProviderKeysStore();
+
+	let loaded = $state(false);
+	let editing = $state<string | null>(null);
+	// Keyed by provider, component-local: drafts never reach the store, and
+	// never reach localStorage/sessionStorage.
+	let drafts = $state<Record<string, string>>({});
+
+	$effect(() => {
+		if (!active || loaded || store.loading) return;
+		loaded = true;
+		void store.load();
+	});
+
+	function edit(provider: string) {
+		editing = provider;
+		drafts = { ...drafts, [provider]: '' };
+	}
+
+	function cancel(provider: string) {
+		editing = null;
+		const { [provider]: _discarded, ...rest } = drafts;
+		drafts = rest;
+	}
+
+	async function save(provider: string) {
+		const key = (drafts[provider] ?? '').trim();
+		if (!key) {
+			store.errors = { ...store.errors, [provider]: 'Enter a key first.' };
+			return;
+		}
+		if (await store.save(provider, key)) {
+			// Only on success: a failed save keeps the draft so the user can retry.
+			cancel(provider);
+			toasts.success(`${provider} key saved`);
+		}
+	}
+
+	async function revoke(provider: string) {
+		const ok = window.confirm(
+			`Revoke your ${provider} key? You'll need to paste it again to restore it.`
+		);
+		if (!ok) return;
+		if (await store.revoke(provider)) toasts.success(`${provider} key revoked`);
+	}
+
+	const labelCls = 'text-xs text-fg-muted';
+	const btnCls =
+		'border border-border px-2 py-1 text-xs text-fg-muted transition hover:text-fg disabled:opacity-50';
+</script>
+
+<!-- supported === null: not probed yet. Render nothing rather than a skeleton —
+     in off/single_user mode the section never appears at all, and a skeleton
+     that vanishes is a flash of content that shouldn't have been there. -->
+{#if store.supported}
+	<section>
+		<h2 class="text-sm text-fg-muted"><span class="text-accent">~/keys</span> <span aria-hidden="true">❯</span></h2>
+		<p class="mt-1 text-xs text-fg-faint">
+			Your own provider keys. Stored encrypted; never shown again after saving.
+		</p>
+
+		{#if store.loading && store.rows.length === 0}
+			<div class="mt-3"><Skeleton rows={3} /></div>
+		{:else}
+			{#if store.error}
+				<p class="mt-3 text-xs text-err">{store.error}</p>
+			{/if}
+
+			<ul class="mt-3 flex flex-col gap-2">
+				{#each store.rows as row (row.provider)}
+					<li class="border border-border bg-surface px-3 py-2">
+						<div class="flex flex-wrap items-center gap-2">
+							<span class="text-sm text-fg">{row.provider}</span>
+							{#if row.isDefault}<span class="text-xs text-fg-faint">default</span>{/if}
+
+							<span class="flex-1 text-xs text-fg-muted">
+								{#if row.status === 'configured'}
+									key set · added {relativeTime(row.created_at)}
+								{:else if row.status === 'revoked'}
+									revoked {relativeTime(row.revoked_at)}
+								{:else}
+									no key
+								{/if}
+							</span>
+
+							{#if editing !== row.provider}
+								<button
+									type="button"
+									onclick={() => edit(row.provider)}
+									disabled={store.busy[row.provider]}
+									class={btnCls}
+								>
+									{row.status === 'configured' ? '❯ replace' : '❯ add key'}
+								</button>
+								{#if row.status === 'configured'}
+									<button
+										type="button"
+										onclick={() => revoke(row.provider)}
+										disabled={store.busy[row.provider]}
+										class={btnCls}
+									>
+										{store.busy[row.provider] ? 'revoking…' : '❯ revoke'}
+									</button>
+								{/if}
+							{/if}
+						</div>
+
+						{#if editing === row.provider}
+							<div class="mt-2 flex flex-wrap items-center gap-2">
+								<label class="sr-only" for="pk-{row.provider}">{row.provider} API key</label>
+								<input
+									id="pk-{row.provider}"
+									type="password"
+									autocomplete="off"
+									spellcheck="false"
+									placeholder="paste key"
+									bind:value={drafts[row.provider]}
+									disabled={store.busy[row.provider]}
+									class="flex-1 border border-border bg-bg px-2 py-1.5 text-sm text-fg"
+								/>
+								<button
+									type="button"
+									onclick={() => save(row.provider)}
+									disabled={store.busy[row.provider]}
+									class="border border-border bg-accent px-3 py-1.5 text-xs font-medium text-accent-contrast transition hover:bg-accent-hover disabled:opacity-50"
+								>
+									{store.busy[row.provider] ? 'saving…' : '❯ save'}
+								</button>
+								<button type="button" onclick={() => cancel(row.provider)} class={btnCls}>cancel</button>
+							</div>
+						{/if}
+
+						{#if store.errors[row.provider]}
+							<p class="mt-2 text-xs text-err">{store.errors[row.provider]}</p>
+						{/if}
+					</li>
+				{/each}
+			</ul>
+		{/if}
+	</section>
+{/if}
+

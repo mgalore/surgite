@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Provider keys are now manageable from the web UI. The dashboard's Settings
+  tab gains a `~/keys` section where a user can set, replace, or revoke their
+  own Anthropic, Groq, DeepSeek, or local key. The section only appears in
+  `multi_user` deployments, and the key is never shown again after saving.
+  (#71)
+- `GET /settings/provider-keys` now also returns `providers` (the server's
+  visible registry, `LLM_LOCAL_ONLY` filtered) and `default`, so a non-admin
+  client can render a key form. The catalogue is names only — whether a
+  provider *has* a key configured remains admin-only on `/providers`. Existing
+  fields are unchanged.
+
 ### Changed
 
 - Repository sync uses metadata-only Git clones and bounded concurrent workers

@@ -246,6 +246,43 @@ export const updatePromptSettings = (update: PromptSettingsUpdate, repoId?: numb
 		body: JSON.stringify(update)
 	});
 
+// --- per-user provider keys (multi_user only) ------------------------------
+
+export interface ProviderKey {
+	provider: string;
+	created_at: string | null;
+	// Non-null = the key was revoked, so the provider is NOT configured.
+	revoked_at: string | null;
+}
+
+export interface ProviderKeysResponse {
+	// The server's visible registry (LLM_LOCAL_ONLY filtered). Names only:
+	// whether a provider has a key configured is admin-only on /providers, so
+	// this deliberately carries no availability data. See docs/security.md.
+	providers: string[];
+	default: string;
+	keys: ProviderKey[];
+}
+
+// 404 in off/single_user mode (_require_multi_user) — the caller hides the
+// whole settings subsection rather than showing a broken form.
+export const fetchProviderKeys = () => request<ProviderKeysResponse>('/settings/provider-keys');
+
+// Set and clear are separate calls rather than one update(req) so that
+// { clear: true, key: '...' } — key material on the wire for no reason — can't
+// be expressed. The raw key is passed straight to the body and never retained.
+export const setProviderKey = (provider: string, key: string) =>
+	request<{ configured: boolean }>('/settings/provider-keys', {
+		method: 'PUT',
+		body: JSON.stringify({ provider, key })
+	});
+
+export const clearProviderKey = (provider: string) =>
+	request<{ configured: boolean }>('/settings/provider-keys', {
+		method: 'PUT',
+		body: JSON.stringify({ provider, clear: true })
+	});
+
 // --- shareable summary links ---
 
 export interface ShareResponse {

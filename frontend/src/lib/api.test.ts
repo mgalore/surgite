@@ -5,7 +5,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import.meta.env.VITE_API_BASE = 'http://api.test';
 
 // Dynamic import so the module evaluates with our env stubs in place.
-const { ingestRepo, login, signup } = await import('./api');
+const { clearProviderKey, fetchProviderKeys, ingestRepo, login, setProviderKey, signup } =
+	await import('./api');
 
 const okBody = (body: unknown) =>
 	({
@@ -246,5 +247,41 @@ describe('resetPassword', () => {
 		} catch (e) {
 			expect((e as Error & { status?: number }).status).toBe(400);
 		}
+	});
+});
+
+
+describe('provider keys', () => {
+	const listBody = { providers: ['groq', 'local'], default: 'groq', keys: [] };
+
+	it('lists without a CSRF header', async () => {
+		fetchSpy.mockResolvedValueOnce(okBody(listBody));
+		await fetchProviderKeys();
+		const [url, init] = fetchSpy.mock.calls[0] as [string, RequestInit | undefined];
+		expect(url).toBe('http://api.test/settings/provider-keys');
+		expect(init?.method).toBeUndefined();
+		expect((init?.headers as Record<string, string>)['X-Requested-With']).toBeUndefined();
+	});
+
+	it('sets a key with a PUT carrying only provider and key', async () => {
+		fetchSpy.mockResolvedValueOnce(okBody({ configured: true }));
+		await setProviderKey('groq', 'gsk_x');
+		const init = fetchSpy.mock.calls[0][1] as RequestInit;
+		expect(init.method).toBe('PUT');
+		expect((init.headers as Record<string, string>)['X-Requested-With']).toBe('surgite-web');
+		expect(JSON.parse(init.body as string)).toEqual({ provider: 'groq', key: 'gsk_x' });
+	});
+
+	it('clears a key without putting key material on the wire', async () => {
+		fetchSpy.mockResolvedValueOnce(okBody({ configured: false }));
+		await clearProviderKey('groq');
+		const body = JSON.parse((fetchSpy.mock.calls[0][1] as RequestInit).body as string);
+		expect(body).toEqual({ provider: 'groq', clear: true });
+		expect('key' in body).toBe(false);
+	});
+
+	it('surfaces the off/single_user 404 as err.status', async () => {
+		fetchSpy.mockResolvedValueOnce(errBody(404, 'Not found'));
+		await expect(fetchProviderKeys()).rejects.toMatchObject({ status: 404 });
 	});
 });

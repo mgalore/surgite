@@ -224,6 +224,72 @@
         "title": "PromptSettingsUpdate",
         "type": "object"
       },
+      "ProviderKeyStatus": {
+        "description": "One of the caller's provider_keys rows. Never carries key material —\nonly the provider name and the row's timestamps. A non-null ``revoked_at``\nmeans the provider is *not* configured.",
+        "properties": {
+          "created_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created At"
+          },
+          "provider": {
+            "title": "Provider",
+            "type": "string"
+          },
+          "revoked_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Revoked At"
+          }
+        },
+        "required": [
+          "provider"
+        ],
+        "title": "ProviderKeyStatus",
+        "type": "object"
+      },
+      "ProviderKeysResponse": {
+        "description": "The caller's own key rows plus the provider catalogue the settings form\nneeds to render. ``providers`` is the server's visible registry\n(LLM_LOCAL_ONLY filtered), deliberately without any key-presence data:\nwhether a provider *has* a key configured stays behind the admin-only\n/providers boundary. See docs/security.md.",
+        "properties": {
+          "default": {
+            "title": "Default",
+            "type": "string"
+          },
+          "keys": {
+            "items": {
+              "$ref": "#/components/schemas/ProviderKeyStatus"
+            },
+            "title": "Keys",
+            "type": "array"
+          },
+          "providers": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Providers",
+            "type": "array"
+          }
+        },
+        "required": [
+          "providers",
+          "default",
+          "keys"
+        ],
+        "title": "ProviderKeysResponse",
+        "type": "object"
+      },
       "ProviderKeysUpdate": {
         "description": "Set (or replace) a per-user provider key. The clear flag revokes the\nexisting row; the key field is required otherwise. The raw key is never\nreturned by the API.",
         "properties": {
@@ -1827,13 +1893,15 @@
     },
     "/settings/provider-keys": {
       "get": {
-        "description": "Which providers the caller has configured. The raw key material is\nnever returned — only the provider name and timestamps.",
+        "description": "Which providers the caller has configured, plus the catalogue of\nprovider names a client needs to render a key form. The raw key material\nis never returned — only the provider name and timestamps.\n\nThe catalogue is names only. Whether a provider has a key configured is an\ninformation-disclosure surface (docs/security.md), which is why /providers\nis admin-only in multi_user; this route is open to every authenticated user,\nso it must not carry that. Revoked rows are returned as-is: `revoked_at`\nnon-null means *not* configured, and it's what a client shows after a\nrevoke.",
         "operationId": "get_provider_keys",
         "responses": {
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/ProviderKeysResponse"
+                }
               }
             },
             "description": "Successful Response"

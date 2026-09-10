@@ -25,7 +25,7 @@ from pathlib import Path
 import pytest
 from sqlalchemy import select
 
-from surgite import config, rate_limit, secrets
+from surgite import config, rate_limit, secrets, summarizer
 from surgite.audit import audit
 from surgite.auth import (
     _generate_api_key,
@@ -570,6 +570,72 @@ def test_provider_key_set_then_list(client, multi_user):
     assert r.status_code == 200
     keys = {k["provider"] for k in r.json()["keys"]}
     assert keys == {"groq", "anthropic"}
+
+
+def test_provider_keys_list_carries_the_visible_registry(client, multi_user):
+    """The list response is the caller's rows plus the provider catalogue a
+    client needs to render a form — nothing else."""
+    sid = _make_session(_make_user())
+    r = client.get("/settings/provider-keys", headers=_cookie_header(sid))
+    assert r.status_code == 200
+    body = r.json()
+    assert set(body) == {"providers", "default", "keys"}
+    assert body["providers"] == list(summarizer.PROVIDERS)
+    assert body["default"] == summarizer.default_provider()
+
+
+def test_provider_keys_list_hides_operator_key_presence(client, multi_user, monkeypatch):
+    """The catalogue must not leak whether the *operator* configured a key.
+
+    That's the /providers disclosure (docs/security.md), and /providers is
+    admin-only in multi_user precisely because of it. This route is open to
+    every authenticated user, so the response has to be identical either way —
+    which is what stops a future refactor reaching for provider_status_for().
+    """
+    sid = _make_session(_make_user())
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    without = client.get("/settings/provider-keys", headers=_cookie_header(sid)).json()
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_operator_secret")
+    with_key = client.get("/settings/provider-keys", headers=_cookie_header(sid)).json()
+    assert without == with_key
+    assert "available" not in repr(with_key)
+    assert "gsk_operator_secret" not in repr(with_key)
+
+
+def test_provider_keys_list_respects_local_only(client, multi_user, monkeypatch):
+    """LLM_LOCAL_ONLY drops the hosted providers, so the form can only offer
+    `local`. Patch the registry, not the env var: _visible() runs once at
+    import (see tests/test_summarizer.py)."""
+    monkeypatch.setattr(summarizer, "PROVIDERS", {"local": summarizer._ALL_PROVIDERS["local"]})
+    sid = _make_session(_make_user())
+    r = client.get("/settings/provider-keys", headers=_cookie_header(sid))
+    assert r.json()["providers"] == ["local"]
+
+
+def test_provider_keys_list_reports_revoked_rows(client, multi_user):
+    """A cleared key stays in the list with revoked_at set, rather than
+    vanishing — that timestamp is the client's post-revoke confirmation."""
+    sid = _make_session(_make_user())
+    client.put(
+        "/settings/provider-keys",
+        json={"provider": "groq", "key": "gsk_x"},
+        headers=_cookie_header(sid),
+    )
+    client.put(
+        "/settings/provider-keys",
+        json={"provider": "groq", "clear": True},
+        headers=_cookie_header(sid),
+    )
+    keys = client.get("/settings/provider-keys", headers=_cookie_header(sid)).json()["keys"]
+    assert [k["provider"] for k in keys] == ["groq"]
+    assert keys[0]["revoked_at"] is not None
+
+
+def test_provider_keys_404_outside_multi_user(client):
+    """_require_multi_user 404s in off/single_user. This is the signal the SPA
+    probes to decide whether to show the provider-keys settings at all."""
+    r = client.get("/settings/provider-keys")
+    assert r.status_code == 404
 
 
 def test_per_user_provider_status_in_multi_user(client, multi_user, monkeypatch):

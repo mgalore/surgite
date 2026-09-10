@@ -106,6 +106,28 @@ class InviteCreateRequest(BaseModel):
     ttl_days: int = 14
 
 
+class ProviderKeyStatus(BaseModel):
+    """One of the caller's provider_keys rows. Never carries key material —
+    only the provider name and the row's timestamps. A non-null ``revoked_at``
+    means the provider is *not* configured."""
+
+    provider: str
+    created_at: str | None = None
+    revoked_at: str | None = None
+
+
+class ProviderKeysResponse(BaseModel):
+    """The caller's own key rows plus the provider catalogue the settings form
+    needs to render. ``providers`` is the server's visible registry
+    (LLM_LOCAL_ONLY filtered), deliberately without any key-presence data:
+    whether a provider *has* a key configured stays behind the admin-only
+    /providers boundary. See docs/security.md."""
+
+    providers: list[str]
+    default: str
+    keys: list[ProviderKeyStatus]
+
+
 class ProviderKeysUpdate(BaseModel):
     """Set (or replace) a per-user provider key. The clear flag revokes the
     existing row; the key field is required otherwise. The raw key is never

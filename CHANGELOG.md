@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-09-10
+
 ### Added
 
 - Provider keys are now manageable from the web UI. The dashboard's Settings

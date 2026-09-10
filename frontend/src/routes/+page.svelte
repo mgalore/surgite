@@ -152,9 +152,6 @@
 		<div id="settings-panel" role="tabpanel" aria-labelledby="settings-tab" hidden={workspace !== 'settings'} class="px-4 pb-6 sm:px-6">
 			<div class="max-w-2xl">
 				<PromptSettings {repos} active={workspace === 'settings'} requestedRepoId={requestedSettingsRepoId} requestVersion={settingsRequestVersion} />
-				<!-- A separate component, not a section of PromptSettings: the two
-				     share no state, so a failed key write can't disturb the prompt
-				     form (and vice versa). Renders nothing outside multi_user. -->
 				<div class="mt-8"><ProviderKeys active={workspace === 'settings'} /></div>
 			</div>
 		</div>

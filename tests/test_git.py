@@ -60,7 +60,6 @@ def test_parse_log_multiple_commits():
 
 
 def test_parse_log_keeps_message_intact_past_three_splits():
-    # split(maxsplit=3): anything after the 3rd separator stays in the message.
     raw = "h1\x1f2026-06-01\x1fA\x1ffix: a\x1fb"
     [commit] = parse_log(raw)
     assert commit.message == "fix: a\x1fb"
@@ -95,14 +94,7 @@ def test_get_raw_log_raises_runtimeerror_outside_a_repo(tmp_path):
 
 
 def test_ensure_repo_clones_a_repo_with_no_recent_commits(tmp_path, monkeypatch):
-    """#34: a dormant repo must still clone.
-
-    A date-bounded shallow clone dies here with "no commits selected for
-    shallow requests"; a count-bounded one truncates a busy repo instead.
-    Two details make this bite: GIT_COMMITTER_DATE, because --shallow-since
-    filters on the committer date and --date only moves the author date; and
-    file://, because git ignores clone filters for a plain local path.
-    """
+    """A dormant repo still clones with its full commit metadata."""
     monkeypatch.setenv("GIT_COMMITTER_DATE", "2020-01-01T00:00:00")
     origin = tmp_path / "origin"
     origin.mkdir()
@@ -119,12 +111,7 @@ def test_ensure_repo_clones_a_repo_with_no_recent_commits(tmp_path, monkeypatch)
 
 
 def test_ensure_repo_refetches_and_keeps_origin_head(tmp_path):
-    """#35: the origin/HEAD refresh must leave the ref resolvable.
-
-    `git remote set-head origin -d` deletes it, and the `reset --hard
-    origin/HEAD` that follows then exits 128 -- breaking every re-ingest of
-    an already-cloned repo.
-    """
+    """Refreshing origin/HEAD keeps repeated ingests resolvable."""
     origin = tmp_path / "origin"
     origin.mkdir()
     _git(origin, "init", "-q")

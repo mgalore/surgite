@@ -17,9 +17,7 @@ from surgite.summarizer import (
 
 
 def _mock_client(handler) -> httpx.AsyncClient:
-    """An AsyncClient whose requests are answered by `handler(request)` instead
-    of hitting the network — exercises the real request-building and
-    response-parsing code paths."""
+    """Build an HTTP client backed by a mock transport."""
     return httpx.AsyncClient(transport=httpx.MockTransport(handler))
 
 
@@ -33,8 +31,6 @@ def _openai_response(text: str) -> httpx.Response:
 
 @pytest.fixture(autouse=True)
 def _clear_discovered_models():
-    """`_discovered_models` lives for the process; without this a discovery in
-    one test would satisfy the next one and hide a regression."""
     summarizer._discovered_models.clear()
     yield
     summarizer._discovered_models.clear()
@@ -82,8 +78,6 @@ def test_registry_is_unfiltered_without_the_flag(monkeypatch):
 
 
 def test_default_provider_falls_back_when_the_default_is_filtered_out(monkeypatch):
-    """With LLM_LOCAL_ONLY the built-in "anthropic" default is gone; an unset
-    LLM_PROVIDER must land on what's left rather than raising."""
     monkeypatch.delenv("LLM_PROVIDER", raising=False)
     monkeypatch.setattr(summarizer, "PROVIDERS", {"local": summarizer._ALL_PROVIDERS["local"]})
     assert default_provider() == "local"
@@ -93,7 +87,6 @@ def test_default_provider_falls_back_when_the_default_is_filtered_out(monkeypatc
 
 
 def test_provider_status_all_unavailable_without_keys():
-    # conftest clears every provider key.
     assert all(s["available"] is False for s in provider_status())
 
 
@@ -220,8 +213,6 @@ async def test_generate_summary_openai_path_with_model_override(monkeypatch):
 
 
 async def test_local_provider_uses_the_base_url_override(monkeypatch):
-    """The self-hosted provider ships with no base_url, so LOCAL_BASE_URL has to
-    reach the request — otherwise every call goes to /chat/completions on no host."""
     monkeypatch.setenv("LOCAL_API_KEY", "internal-token")
     monkeypatch.setenv("LOCAL_BASE_URL", "http://llm.internal:8000/v1")
     monkeypatch.setenv("LOCAL_MODEL", "internal-model")
@@ -409,9 +400,6 @@ def _local_env(monkeypatch, model: str | None = None):
 
 
 async def test_local_model_is_discovered_when_unset(monkeypatch):
-    """No LOCAL_MODEL: ask the server what it serves rather than guessing a
-    vendor default. The discovered id must reach the chat request, not just
-    the return value."""
     _local_env(monkeypatch)
     seen: list[str] = []
 
@@ -457,8 +445,6 @@ async def test_explicit_local_model_skips_discovery(monkeypatch):
 
 
 async def test_ambiguous_model_list_asks_for_an_explicit_choice(monkeypatch):
-    """A proxy fronting several models can't be guessed at; silently picking
-    one would be a wrong-model bug nobody notices."""
     _local_env(monkeypatch)
     client = _mock_client(lambda req: _models_response("model-a", "model-b"))
     with pytest.raises(ProviderError, match="LOCAL_MODEL"):
@@ -473,8 +459,6 @@ async def test_empty_model_list_raises(monkeypatch):
 
 
 async def test_unreachable_models_endpoint_names_the_env_var(monkeypatch):
-    """The failure a misconfigured deployment actually hits — the message has
-    to point at the fix, not just report a connection error."""
     _local_env(monkeypatch)
 
     def boom(req: httpx.Request) -> httpx.Response:

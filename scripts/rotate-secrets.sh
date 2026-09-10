@@ -1,28 +1,14 @@
 #!/usr/bin/env bash
-# Rotate the SECRETS_ENCRYPTION_KEY.
-#
-# Re-encrypts every active provider_keys row under the new key and swaps
-# the master key in place. The running API process is unaffected — the
-# in-process Fernet is built once at import time and cached; restart it
-# to pick up the new key. The audit log records who ran the rotation
-# (the operator) but the API itself doesn't see this script.
-#
+# Re-encrypt active provider keys under a new master key.
 # Usage:
 #   scripts/rotate-secrets.sh                       # generate a new key, persist
 #   scripts/rotate-secrets.sh <new-raw-key>         # use a specific key
 #   scripts/rotate-secrets.sh <new-fernet-key>      # 44-char urlsafe-b64 key
-#
-# Either form is fine; we derive the Fernet key from the input the same
-# way surgite/secrets.py does (accepting either a Fernet key or an
-# arbitrary passphrase).
 
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-# Must match surgite/secrets.py: the fallback key's location is overridable so
-# containerised deployments can put it on a volume. Rotating the wrong file
-# re-encrypts every row under a key the API will never load.
 KEY_FILE="${SECRETS_KEY_FILE:-.secrets_key}"
 
 if [ ! -f "$KEY_FILE" ]; then
@@ -38,13 +24,6 @@ if [ -z "$NEW_INPUT" ]; then
 else
   NEW_KEY="$NEW_INPUT"
 fi
-
-# Re-encrypt every active provider_keys row under the new key. The
-# `update` SQL has to use the OLD key to decrypt first; the script
-# reads the current .secrets_key (the OLD master), decrypts each row,
-# swaps the master, then re-encrypts. We use a single Python
-# transaction so a crash mid-rotation doesn't leave the table half-
-# encrypted.
 
 OLD_KEY=$(cat "$KEY_FILE")
 
@@ -75,9 +54,6 @@ new_fernet = Fernet(_derive(NEW_MATERIAL))
 from surgite.db import ProviderKeyRow, session_scope
 from surgite.config import DATABASE_URL
 
-# Cheap guard: refuse to run on a SQLite test DB. The check is the
-# dialect name; if we ever support other backends, this branch needs
-# to grow.
 if DATABASE_URL.startswith("sqlite"):
     print("refusing to rotate on a SQLite database (test DB?)", file=sys.stderr)
     sys.exit(2)
@@ -95,7 +71,6 @@ with session_scope() as s:
     s.commit()
 PYEOF
 
-# Persist the new master.
 mkdir -p "$(dirname "$KEY_FILE")"
 printf '%s\n' "$NEW_KEY" > "$KEY_FILE"
 chmod 600 "$KEY_FILE"

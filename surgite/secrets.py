@@ -1,30 +1,4 @@
-"""At-rest encryption for per-user provider keys.
-
-The master key lives in the ``SECRETS_ENCRYPTION_KEY`` env var. If unset on
-import we generate a fresh Fernet key, save it to the path in
-``SECRETS_KEY_FILE`` (default: ``.secrets_key`` next to the project root)
-with ``chmod 600``, log a one-time warning telling the operator to back it
-up, and use it for this process.
-
-``SECRETS_KEY_FILE`` exists because the default location is only durable
-when the project root is. In a container it is not: the app lives in
-``/app``, which is an image layer, so a generated key dies with the
-container and every ``provider_keys`` row encrypted under it becomes
-permanently undecryptable on the next redeploy. The compose file points
-this at a named volume so the fallback survives a restart.
-
-This is a service-local secret, not a deployment-wide one — every process
-that needs to decrypt a row must see the same key. In production the
-operator sets ``SECRETS_ENCRYPTION_KEY`` directly (e.g. via systemd
-``EnvironmentFile=``, a Kubernetes Secret, or the docker-compose env file).
-The on-disk fallback is for first-run convenience in a homelab deployment
-where there is no env-var-injection machinery handy.
-
-Rotation (``scripts/rotate-secrets.sh``) reads the new key, re-encrypts
-every ``provider_keys`` row, and atomically swaps the file. A restart of
-the API is required to pick up the new key; the in-process Fernet object
-is built once at import time and cached.
-"""
+"""Fernet encryption for per-user provider keys."""
 
 import base64
 import binascii
@@ -37,21 +11,12 @@ from cryptography.fernet import Fernet, InvalidToken
 
 log = logging.getLogger(__name__)
 
-# Project root: two levels up from surgite/secrets.py. AGENTS.md lives there.
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
-# Override the fallback key's location for deployments where the project root
-# is not durable storage — see the module docstring.
 _SECRETS_FILE = Path(os.environ.get("SECRETS_KEY_FILE") or _PROJECT_ROOT / ".secrets_key")
 
 
 def _derive_fernet_key(material: str) -> bytes:
-    """Fernet wants a 32-byte url-safe base64 key. Accept either:
-      - a 44-char urlsafe-b64 string (raw Fernet key, the usual case for
-        a value the operator pastes from a secret manager), or
-      - an arbitrary passphrase (we SHA-256 it and base64-encode).
-    The derived form is also stable across processes, so a passphrase set
-    via SECRETS_ENCRYPTION_KEY in dev works the same way on every restart.
-    """
+    """Accept a Fernet key or derive one deterministically from a passphrase."""
     material = material.strip()
     try:
         decoded = base64.urlsafe_b64decode(material)
@@ -83,18 +48,17 @@ def _load_or_create_master_key() -> bytes:
     return key
 
 
-# Cached for the life of the process. Rotations require a restart.
+# Rotations require a restart to replace this process-local value.
 _fernet: Fernet = Fernet(_load_or_create_master_key())
 
 
 def encrypt(plaintext: str) -> str:
-    """Encrypt a provider key. Returns a urlsafe-b64 Fernet token (str)."""
+    """Encrypt a provider key."""
     return _fernet.encrypt(plaintext.encode("utf-8")).decode("ascii")
 
 
 def decrypt(token: str) -> str:
-    """Decrypt a Fernet token. Raises InvalidToken if the master key has
-    changed (rotation that wasn't completed) or the row is corrupt."""
+    """Decrypt a provider key, raising ValueError for invalid tokens."""
     try:
         return _fernet.decrypt(token.encode("ascii")).decode("utf-8")
     except InvalidToken as e:
@@ -102,10 +66,7 @@ def decrypt(token: str) -> str:
 
 
 def rotate_to(new_material: str) -> None:
-    """Swap the in-process Fernet to a new master key. Caller is responsible
-    for re-encrypting all stored rows with the new key first (see
-    scripts/rotate-secrets.sh). Writes the new key to the on-disk file so
-    a subsequent restart doesn't fall back to the old one."""
+    """Replace the active and persisted master after row re-encryption."""
     global _fernet
     _fernet = Fernet(_derive_fernet_key(new_material))
     _SECRETS_FILE.parent.mkdir(parents=True, exist_ok=True)

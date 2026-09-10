@@ -1,15 +1,4 @@
-"""Model-agnostic commit summarization.
-
-One summary, any provider. Pick the provider via the LLM_PROVIDER env var or
-per call. GROQ, DeepSeek and a self-hosted server expose OpenAI-compatible chat
-endpoints, so they share a code path; Anthropic uses its Messages API. All
-calls go over plain HTTP via `httpx.AsyncClient` so no provider SDK is required
-and the per-repo fan-out runs concurrently on the event loop rather than on
-FastAPI's request threadpool.
-
-Deployments that must not reach outside their network set LLM_LOCAL_ONLY=1,
-which leaves only the self-hosted provider in the registry.
-"""
+"""Model-agnostic commit summarization over HTTP."""
 
 import asyncio
 import json
@@ -20,19 +9,11 @@ from dataclasses import dataclass
 import httpx
 from sqlalchemy import select
 
-# Per-call HTTP timeout. Generous: a cold provider + a long commit log can take
-# a while to summarize. Overridable per call so the streaming path can use a
-# longer read budget if needed.
 _TIMEOUT = 120.0
 _MAX_TOKENS = 1024
-# Concurrent provider calls in generate_summary_per_repo: enough to collapse the
-# per-repo round-trips without hammering the provider's rate limits.
 _MAX_PARALLEL_SUMMARIES = 4
 DEFAULT_PROVIDER = "anthropic"
-# Models discovered from a self-hosted server's GET /models, keyed by base_url.
-# ponytail: process-lifetime cache, one probe per server. A server that swaps
-# the model it serves needs a restart to be noticed; set the *_MODEL env var if
-# that's ever a problem.
+# Self-hosted model discovery is cached for the process lifetime.
 _discovered_models: dict[str, str] = {}
 
 _TONE_INSTRUCTIONS: dict[str, str] = {
@@ -59,19 +40,14 @@ class Provider:
 
     @property
     def api_key(self) -> str | None:
-        # Read at call time so .env (loaded by surgite.config) is in effect.
         return os.environ.get(self.key_env) or None
 
     @property
     def base_url(self) -> str:
-        # Also call-time: a self-hosted endpoint can't ship as a constant, and
-        # the hosted ones get an override for free (proxy, gateway, VCR test).
         return os.environ.get(self.url_env) or self.default_base_url
 
     def model(self, override: str | None = None) -> str:
-        """The configured model. Empty for a self-hosted server that ships no
-        default and hasn't been asked what it serves yet — `resolve_model`
-        fills that in, and the answer lands in the cache consulted here."""
+        """Return the overridden, configured, default, or discovered model."""
         return (
             override
             or os.environ.get(self.model_env)
@@ -111,10 +87,6 @@ _ALL_PROVIDERS: dict[str, Provider] = {
     "local": Provider(
         name="local",
         kind="openai",
-        # Neither of these can have a sensible default: LOCAL_BASE_URL must
-        # point at the OpenAI-compatible root (e.g. http://llm.internal:8000/v1,
-        # the code appends the path), and the model is whatever that server
-        # happens to serve — asked for at call time, see `resolve_model`.
         default_base_url="",
         key_env="LOCAL_API_KEY",
         url_env="LOCAL_BASE_URL",
@@ -125,10 +97,7 @@ _ALL_PROVIDERS: dict[str, Provider] = {
 
 
 def _visible(providers: dict[str, Provider]) -> dict[str, Provider]:
-    """LLM_LOCAL_ONLY=1 drops every hosted provider from the registry, so
-    nothing downstream — provider selection, per-user key storage, the
-    /health/deep reachability probe — can reach a host outside the network.
-    Read once at import; changing it needs a restart."""
+    """Restrict the registry to local inference when configured."""
     if os.environ.get("LLM_LOCAL_ONLY", "").lower() in {"1", "true", "yes"}:
         return {"local": providers["local"]}
     return providers
@@ -140,8 +109,7 @@ PROVIDERS: dict[str, Provider] = _visible(_ALL_PROVIDERS)
 def default_provider() -> str:
     env = os.environ.get("LLM_PROVIDER")
     if env:
-        return env.lower()  # an unknown name still errors, rather than silently falling back
-    # LLM_LOCAL_ONLY can remove the built-in default from the registry.
+        return env.lower()
     return DEFAULT_PROVIDER if DEFAULT_PROVIDER in PROVIDERS else next(iter(PROVIDERS))
 
 
@@ -160,10 +128,7 @@ async def resolve_model(
     api_key: str,
     override: str | None = None,
 ) -> str:
-    """The model to send. When nothing is configured — the self-hosted case —
-    ask the server what it serves rather than making the operator name it in
-    .env. Most self-hosted deployments serve exactly one model; more than one
-    is ambiguous, so that asks for an explicit choice instead of guessing."""
+    """Resolve a model, discovering the sole model on self-hosted servers."""
     name = provider.model(override)
     if name:
         return name
@@ -194,14 +159,12 @@ async def resolve_model(
 
 
 def display_model(provider: Provider) -> str:
-    """What to show a user for a provider whose model isn't known yet. Never
-    used to build a request — `resolve_model` does that."""
+    """Return a display value without triggering model discovery."""
     return provider.model() or "auto"
 
 
 def _require_key(provider: Provider, key: str | None = None) -> str:
-    """Return the API key for `provider`. `key` overrides the env var lookup
-    (used in multi_user mode to pass a per-user key from the DB)."""
+    """Return an explicit or environment-provided API key."""
     if key:
         return key
     env_key = provider.api_key
@@ -211,8 +174,7 @@ def _require_key(provider: Provider, key: str | None = None) -> str:
 
 
 def provider_status() -> list[dict]:
-    """Provider catalogue for clients: name, default model, and whether a key
-    is configured. Lets a UI offer only the providers that will actually work."""
+    """Return provider metadata for single-user clients."""
     default = default_provider()
     return [
         {
@@ -226,12 +188,7 @@ def provider_status() -> list[dict]:
 
 
 def provider_status_for(user_id: str) -> list[dict]:
-    """Per-user provider status. A provider is
-    ``available`` for this user if either their per-user DB row has a
-    non-revoked key OR the env-var fallback is set. The single-user fallback
-    is the env-var lookup (so a homelab operator who set
-    ``ANTHROPIC_API_KEY=*** on the host still gets a working summary
-    without configuring per-user keys)."""
+    """Return provider metadata with per-user key availability."""
     default = default_provider()
     out: list[dict] = []
     for p in PROVIDERS.values():
@@ -247,8 +204,7 @@ def provider_status_for(user_id: str) -> list[dict]:
 
 
 def _user_has_active_key(user_id: str, provider_name: str) -> bool:
-    """True iff the user has a non-revoked provider_keys row for
-    `provider_name`."""
+    """Return whether the user has an active key for the provider."""
     try:
         from surgite.db import ProviderKeyRow, get_session
     except ImportError:
@@ -265,8 +221,7 @@ def _user_has_active_key(user_id: str, provider_name: str) -> bool:
 
 
 def user_provider_key(user_id: str, provider_name: str) -> str | None:
-    """The active per-user provider key (decrypted), or None. Callers
-    fall back to the env-var key when this is None."""
+    """Decrypt the user's active provider key, if any."""
     try:
         from surgite.db import ProviderKeyRow, get_session
         from surgite.secrets import decrypt
@@ -385,10 +340,7 @@ def _extract_text(provider: Provider, payload: dict) -> str:
 
 
 def _delta_text(payload: dict) -> str | None:
-    """Pull the incremental text out of one streamed SSE data object, for either
-    the OpenAI-compatible (`choices[].delta.content`) or Anthropic
-    (`content_block_delta` → `delta.text`) wire format. Returns None for the
-    many control frames that carry no text."""
+    """Extract text from an OpenAI or Anthropic stream event."""
     if "choices" in payload:
         return payload["choices"][0].get("delta", {}).get("content") or None
     if payload.get("type") == "content_block_delta":
@@ -411,9 +363,7 @@ async def _post_json(
 
 
 def _resolve_key(resolved: Provider, user_id: str | None) -> str:
-    """The API key for `resolved`, preferring a per-user DB row in multi_user
-    mode and falling back to the env-var key in single_user / off mode
-    (or when the user has no row for this provider)."""
+    """Prefer the user's provider key, falling back to the environment."""
     if user_id is not None:
         per_user = user_provider_key(user_id, resolved.name)
         if per_user is not None:
@@ -430,14 +380,7 @@ async def generate_summary(
     user_id: str | None = None,
     api_key: str | None = None,
 ) -> dict:
-    """Summarize a formatted commit log with the chosen (or default) provider.
-
-    Returns the summary plus the provider and model actually used. Raises
-    ProviderError if the provider is unknown or its key is missing; lets
-    httpx errors propagate so callers can map them to a 502. Pass `client` to
-    share a connection pool across a concurrent fan-out. `user_id` selects
-    the per-user provider key in multi_user mode (falls back to the env-var
-    key when the user has no row)."""
+    """Summarize a commit log and return the text, provider, and model."""
     resolved = resolve_provider(provider)
     api_key = api_key or _resolve_key(resolved, user_id)
     system = _build_system_prompt(settings)
@@ -462,14 +405,7 @@ async def generate_summary_per_repo(
     api_key: str | None = None,
     model: str | None = None,
 ) -> dict[str, dict[str, str]]:
-    """Generate one AI summary per repo, calling the provider concurrently over
-    a single shared connection pool. Returns {repo_name: {summary, provider,
-    model}} in input order. A bounded semaphore keeps the fan-out from
-    exceeding _MAX_PARALLEL_SUMMARIES in-flight calls.
-
-    Per-repo prompt overrides go in `settings_by_repo` (keyed by repo name);
-    `settings` is the fallback for any repo without its own entry. `user_id`
-    selects the per-user provider key in multi_user mode."""
+    """Summarize repos concurrently with bounded provider calls."""
     pending = {name: log for name, log in log_by_repo.items() if log.strip()}
     by_repo = settings_by_repo or {}
     summaries: dict[str, dict[str, str]] = {}
@@ -506,9 +442,6 @@ async def generate_summary_per_repo(
                     return failure(exc)
 
         async with httpx.AsyncClient() as client:
-            # API callers pass the key once per request, which also lets this
-            # path discover a local model once before fan-out. Preserve the
-            # public helper's per-repository error capture when called alone.
             try:
                 if api_key is not None or model is not None:
                     resolved = resolve_provider(provider)
@@ -535,14 +468,7 @@ async def stream_summary(
     user_id: str | None = None,
     api_key: str | None = None,
 ) -> AsyncIterator[str]:
-    """Yield text deltas as the provider streams its summary. Resolves the
-    provider and key up front (raising ProviderError before any I/O), then
-    opens a streaming request and yields each text fragment. The model is
-    resolved on first iteration, not here, because discovering it needs the
-    client — so a self-hosted server with no usable model raises ProviderError
-    from the iterator rather than from the call. httpx errors propagate to the
-    caller, which maps them to an SSE `error` event. `user_id` selects the
-    per-user provider key in multi_user mode."""
+    """Yield text deltas from a provider's streaming response."""
     resolved = resolve_provider(provider)
     api_key = api_key or _resolve_key(resolved, user_id)
     system = _build_system_prompt(settings)
@@ -586,6 +512,5 @@ async def stream_summary(
 
 
 def summarize_commits(summary: str, provider: str | None = None) -> str:
-    """Backward-compatible synchronous helper (used by the CLI): returns just
-    the text. Drives the async path on a private event loop."""
+    """Synchronously summarize commits for the CLI."""
     return asyncio.run(generate_summary(summary, provider=provider))["summary"]

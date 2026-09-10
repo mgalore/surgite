@@ -27,15 +27,12 @@ def _uuid() -> str:
     return str(uuid.uuid4())
 
 
-class Base(DeclarativeBase):  # Base class for SQLAlchemy models
+class Base(DeclarativeBase):
     pass
 
 
 class OrgRow(Base):
-    """An organisation — the tenancy boundary introduced in 1.0.0. Every user
-    has exactly one *personal* org (see surgite.auth.create_personal_org).
-    Ownership lives in org_members (there is no owner_id here); `deleted_at`
-    is a soft-delete marker, currently always null."""
+    """An organization and tenancy boundary."""
 
     __tablename__ = "orgs"
 
@@ -50,9 +47,7 @@ class OrgRow(Base):
 
 
 class OrgMemberRow(Base):
-    """Membership of a user in an org, with a role. Composite PK (org_id,
-    user_id) — a user is in an org at most once. `role` is one of
-    owner | admin | member (plain string, matching invites.role)."""
+    """A user's role within an organization."""
 
     __tablename__ = "org_members"
 
@@ -68,14 +63,7 @@ class OrgMemberRow(Base):
 
 
 class UserRow(Base):
-    """An account. In AUTH_MODE=off/single_user a single bootstrap user owns
-    everything (see surgite.auth.ensure_bootstrap_user); multi_user mode has
-    one row per real account.
-
-    `email` is stored lower-cased and is unique. Postgres uses a CITEXT column
-    (see the migration) for index-supported case-insensitive lookups; the
-    SQLite test DB falls back to a plain String, so the app lower-cases on the
-    way in to keep the two backends consistent."""
+    """A user account."""
 
     __tablename__ = "users"
 
@@ -90,21 +78,16 @@ class UserRow(Base):
         default=lambda: datetime.now(UTC),
     )
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    # The user's personal org (1.0.0). Nullable only because the FK is added
-    # before the backfill runs; after migration every user has one.
+    # Nullable for migration compatibility.
     personal_org_id: Mapped[str | None] = mapped_column(
         ForeignKey("orgs.id", ondelete="SET NULL"), nullable=True
     )
-    # Lockout: consecutive failed logins trip a per-user lockout window.
-    # `failed_login_count` is reset to 0 on a successful login.
     failed_login_count: Mapped[int] = mapped_column(Integer, default=0)
     locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class SessionRow(Base):
-    """A server-side session. The opaque `id` is what the cookie carries; the
-    cookie never holds user data. Swept by surgite.auth.purge_expired_sessions
-    on the lifespan scheduler, and rejected on read once past `expires_at`."""
+    """A server-side session referenced by an opaque cookie."""
 
     __tablename__ = "sessions"
 
@@ -127,9 +110,7 @@ class SessionRow(Base):
 
 
 class InviteRow(Base):
-    """A single-use invite token. `email` null means any email can claim it.
-    The bootstrap invite (created on first run for BOOTSTRAP_OWNER_EMAIL) has
-    a null `created_by` because no user exists yet to author it."""
+    """A single-use, optionally email-bound invite."""
 
     __tablename__ = "invites"
 
@@ -149,8 +130,6 @@ class InviteRow(Base):
     used_by: Mapped[str | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
-    # The issuing org (1.0.0): a personal org for self-issued invites, a
-    # shared org for admin-issued ones. Distinct from created_by/used_by.
     org_id: Mapped[str | None] = mapped_column(
         ForeignKey("orgs.id", ondelete="SET NULL"), nullable=True
     )
@@ -160,8 +139,7 @@ class CommitRow(Base):
     __tablename__ = "commits"
     __table_args__ = (Index("ix_commits_owner_repo_date", "owner_id", "repo_id", "date"),)
 
-    # A commit can belong to more than one registered repository (notably a
-    # fork and its upstream). Identity is therefore repository-local.
+    # Commit identity is repository-local because forks share hashes.
     hash: Mapped[str] = mapped_column(String, primary_key=True)
     short_hash: Mapped[str] = mapped_column(String(7))
     date: Mapped[date] = mapped_column(Date)
@@ -184,8 +162,6 @@ class RepoRow(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String, unique=True)
     clone_url: Mapped[str] = mapped_column(String, unique=True)
-    # owner_id is nullable from 1.0.0: an org-owned repo has owner_id NULL,
-    # org_id set. Personal repos keep owner_id and get their personal org_id.
     owner_id: Mapped[str | None] = mapped_column(
         ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=True
     )
@@ -207,12 +183,7 @@ class RepoRow(Base):
 
 class PromptSettingsRow(Base):
     __tablename__ = "prompt_settings"
-    # One settings row per (owner, repo), plus one global row per owner with
-    # repo_id IS NULL. The unique constraint stops a repo from getting two
-    # rows; the single per-owner global row is maintained by the get-or-create
-    # logic in the API (a partial unique index on NULL isn't portable to the
-    # SQLite test DB, and NULL repo_id values are distinct under the unique
-    # constraint anyway).
+    # Global rows use repo_id=NULL; SQLite prevents a portable unique constraint.
     __table_args__ = (
         UniqueConstraint("owner_id", "repo_id", name="uq_prompt_settings_owner_repo"),
     )
@@ -240,10 +211,7 @@ class PromptSettingsRow(Base):
 
 
 class SharedSummaryRow(Base):
-    """A saved, shareable summary query. The slug is the only secret; resolving
-    it re-runs the stored params. Expired rows are swept by the scheduler and
-    rejected on read (see surgite.api). In multi_user mode, resolution is
-    owner-scoped (a non-owner gets 404 to avoid slug existence leak)."""
+    """An owner-scoped saved summary query."""
 
     __tablename__ = "shared_summaries"
 
@@ -263,11 +231,7 @@ class SharedSummaryRow(Base):
 
 
 class ApiKeyRow(Base):
-    """A per-user, long-lived API key (Bearer token) for the CLI. `prefix` is
-    the first 8 chars of the key (used as a fast lookup index — the
-    `Authorization: Bearer *** header carries the full key, and we verify
-    the rest against the argon2id `key_hash`). Revoking sets `revoked_at`;
-    the row stays for audit."""
+    """A hashed Bearer key with a lookup prefix."""
 
     __tablename__ = "api_keys"
 
@@ -289,11 +253,7 @@ class ApiKeyRow(Base):
 
 
 class ProviderKeyRow(Base):
-    """A per-user LLM provider API key, Fernet-encrypted at rest. `provider`
-    is the lowercase name (`anthropic`, `groq`, `deepseek`). The raw key is
-    never returned by the API; the master key comes from
-    `SECRETS_ENCRYPTION_KEY` (see surgite/secrets.py). Revoking sets
-    `revoked_at`; the row stays for audit."""
+    """A per-user provider key encrypted at rest."""
 
     __tablename__ = "provider_keys"
     __table_args__ = (
@@ -315,15 +275,7 @@ class ProviderKeyRow(Base):
 
 
 class PasswordResetRow(Base):
-    """A one-time password-reset token. The admin mints a
-    token, delivers it out of band, the user redeems it at
-    ``POST /auth/password-reset/confirm``. The row stores only an
-    argon2id hash of the token (we look it up via the prefix index on
-    ``id``, which is a short random identifier prefixed to the token
-    the user actually receives — see ``surgite.auth.mint_password_reset``).
-    Used rows are kept with ``used_at`` set for audit; the lookup
-    rejects them on read.
-    """
+    """A hashed, one-time password-reset token."""
 
     __tablename__ = "password_resets"
 
@@ -342,10 +294,7 @@ class PasswordResetRow(Base):
 
 
 class AuditLogRow(Base):
-    """An append-only event log. `actor_id` is nullable so pre-auth events
-    (login failures, invite redemptions) can be recorded against an
-    unauthenticated request. `metadata` is JSONB on Postgres for
-    indexable search."""
+    """An append-only security event."""
 
     __tablename__ = "audit_log"
 

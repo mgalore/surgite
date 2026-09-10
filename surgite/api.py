@@ -95,7 +95,6 @@ from surgite.summarizer import ProviderError
 configure_logging()
 log = logging.getLogger(__name__)
 
-# Cap on commits sent to the LLM in /summary?ai=true to bound token cost.
 AI_SUMMARY_MAX_COMMITS = 500
 INGEST_ERROR = "Could not sync repository; check its URL and credentials."
 
@@ -104,11 +103,7 @@ _active_ingests_lock = threading.Lock()
 
 
 def _ingest_interval_seconds() -> int:
-    """Return the scheduler interval from the current process environment.
-
-    Keeping this in one place lets the scheduler and the UI's freshness window
-    agree, while retaining the test-friendly startup-time environment lookup.
-    """
+    """Read the scheduler interval at startup."""
     return int(os.environ.get("INGEST_INTERVAL", "300"))
 
 
@@ -117,7 +112,7 @@ def _ingest_concurrency() -> int:
 
 
 def _claim_ingest(repo_id: int) -> bool:
-    """Atomically reserve a repo for ingestion in this process."""
+    """Reserve a repo for ingestion in this process."""
     with _active_ingests_lock:
         if repo_id in _active_ingests:
             return False
@@ -131,12 +126,7 @@ def _release_ingest(repo_id: int) -> None:
 
 
 def _ingest_all_repos(executor: ThreadPoolExecutor | None = None) -> list[dict]:
-    """Ingest every registered repo. The background scheduler calls this on
-    a timer (see `_scheduler_loop`); the /summary endpoint itself stays a
-    pure read against the DB. The per-repo ingest (`_ingest_repo`) is still
-    wired up as a FastAPI BackgroundTask on `POST /repos` so newly added
-    repos show up immediately rather than waiting up to INGEST_INTERVAL
-    seconds. Returns list of per-repo result/error dicts."""
+    """Ingest every unreserved repo and return their results."""
     results: list[dict] = []
     with session_scope() as s:
         repo_data = [(r.id, r.name) for r in s.scalars(select(RepoRow)).all()]
@@ -160,8 +150,7 @@ def _ingest_repo(
     until: date | None = None,
     session: Session | None = None,
 ) -> dict:
-    """Ingest commits for a single repo. Commits inherit the repo's owner.
-    Returns a result dict."""
+    """Ingest commits for one repo."""
     from surgite.config import REPO_CACHE_DIR
     from surgite.git import ensure_repo
 
@@ -212,7 +201,7 @@ def _ingest_repo(
 
 
 def _run_ingest(repo_id: int, fallback_name: str | None = None) -> dict:
-    """Run one previously-reserved ingest and persist its completed outcome."""
+    """Run a reserved ingest and persist its outcome."""
     repo_name = fallback_name or str(repo_id)
     started = time.monotonic()
     try:
@@ -254,9 +243,7 @@ def _run_ingest(repo_id: int, fallback_name: str | None = None) -> dict:
 
 
 def _delete_expired_summaries() -> int:
-    """Sweep shared-summary slugs past their expiry. Read-path also rejects
-    expired slugs, so this is just housekeeping to keep the table small.
-    Returns the number of rows deleted."""
+    """Delete expired shared summaries."""
     now = datetime.now(UTC)
     with session_scope() as s:
         rows = s.scalars(select(SharedSummaryRow).where(SharedSummaryRow.expires_at <= now)).all()
@@ -267,22 +254,14 @@ def _delete_expired_summaries() -> int:
 
 
 def _scheduler_tick(executor: ThreadPoolExecutor) -> None:
-    """One pass of the background work: ingest every repo, prune expired share
-    slugs, and purge expired sessions. Runs in a thread (sync DB + git) off
-    the event loop."""
+    """Run one background-maintenance pass."""
     _ingest_all_repos(executor)
     _delete_expired_summaries()
     purge_expired_sessions()
 
 
 async def _scheduler_loop(interval: int, executor: ThreadPoolExecutor) -> None:
-    """Background task: every `interval` seconds, ingest all registered repos
-    and prune expired share slugs.
-
-    Runs `_scheduler_tick` in a thread (it's sync, talks to git + DB) so
-    the event loop stays responsive. Any exception is logged and the loop
-    continues — a transient git failure must not stop the scheduler. Stops
-    cleanly when the task is cancelled at app shutdown."""
+    """Run maintenance in a worker thread at the configured interval."""
     log.info("Background ingest scheduler started (interval=%ds)", interval)
     try:
         while True:
@@ -291,8 +270,6 @@ async def _scheduler_loop(interval: int, executor: ThreadPoolExecutor) -> None:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                # Defence in depth: _ingest_all_repos already swallows per-repo
-                # failures, so anything reaching here is unexpected.
                 log.exception("Background ingest loop failed: %s", exc)
             await asyncio.sleep(interval)
     except asyncio.CancelledError:
@@ -302,12 +279,7 @@ async def _scheduler_loop(interval: int, executor: ThreadPoolExecutor) -> None:
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    """Start the background ingest scheduler on app startup, cancel it on
-    shutdown. Disabled (interval<=0) for tests and one-off CLI runs where
-    a background task would never be observed.
-
-    INGEST_INTERVAL is read fresh from the environment on every startup so
-    tests can flip it without reloading the config module."""
+    """Manage bootstrap and background-ingest resources."""
     if config.AUTH_MODE == "multi_user":
         with session_scope() as s:
             token = ensure_bootstrap_invite(s)
@@ -336,8 +308,6 @@ async def _lifespan(app: FastAPI):
                 await task
             except asyncio.CancelledError:
                 pass
-        # Shutdown is only reached during application teardown. Waiting here
-        # lets in-flight Git subprocesses finish within their own timeout.
         executor.shutdown(wait=True, cancel_futures=True)
         if getattr(app.state, "ingest_executor", None) is executor:
             app.state.ingest_executor = None
@@ -357,24 +327,14 @@ def _submit_ingest(
         background.add_task(_await_ingest, executor.submit(_run_ingest, repo_id, repo_name))
 
 
-# Document the stable error envelope once, for every route. OpenAPI's
-# `default` response means "any status not otherwise listed" — accurate
-# here because every error path (HTTPException, the CSRF and SQLAlchemy
-# handlers below) serialises to the same {"detail": "..."} shape. This
-# puts ErrorResponse in components/schemas and declares the contract the
-# 0.6.0 api-stability policy promises, without per-route boilerplate.
-# Routes that want to call out a specific status + header (login's 423,
-# api-key issuance's 429) add it on their own decorator.
-# ponytail: one app-level default beats responses= on all 36 routes.
+# Shared OpenAPI error envelope.
 _ERROR_RESPONSES: dict = {
     "default": {"model": ErrorResponse, "description": 'Error: `{"detail": "..."}`.'}
 }
 
 app = FastAPI(title="surgite", lifespan=_lifespan, responses=_ERROR_RESPONSES)
 
-# Allow the Vite dev server (separate origin) to call the API during development.
-# In production the frontend is served same-origin from the static mount below, so
-# these origins simply go unused.
+# Development-only Vite origins; production is same-origin.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
@@ -383,23 +343,7 @@ app.add_middleware(
 )
 
 
-# CSRF defence in depth. The session cookie is ``SameSite=Lax`` so the
-# browser won't send it on cross-site POSTs; this
-# adds a header check on top so a same-site XHR can't get away with a
-# missing intent signal either.
-#
-# Rules:
-#  - The check is only active in multi_user mode (no session cookie in
-#    off/single_user; the test suite would burn cycles on noise).
-#  - Safe methods (GET/HEAD/OPTIONS) and a small allowlist (login,
-#    logout, redeem-invite, health) are exempt — login and redeem
-#    are pre-session endpoints where the cookie doesn't exist yet,
-#    and the SameSite=Lax cookie already provides the cross-site
-#    protection.
-#  - The SPA sends ``X-Requested-With: surgite-web`` on every state-
-#    changing request. The CLI uses Bearer auth and never hits a
-#    state-changing route, so the header requirement is invisible to
-#    it.
+# Stateful SPA requests must carry an intent header.
 _UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 _CSRF_EXEMPT_PATHS = {
     "/auth/login",
@@ -455,14 +399,12 @@ def _repo_to_dict(row: RepoRow) -> dict:
 
 
 def _owned_repo(session: Session, repo_id: int, owner_id: str) -> RepoRow | None:
-    """Fetch a repo by id only if `owner_id` owns it. Returns None otherwise,
-    so callers turn cross-owner access into a 404."""
+    """Return an owned repo without revealing cross-owner rows."""
     repo = session.get(RepoRow, repo_id)
     return repo if repo is not None and repo.owner_id == owner_id else None
 
 
 def _row_to_dict(row: CommitRow) -> dict:
-    """Convert a CommitRow to a dictionary."""
     return {
         "hash": row.hash,
         "short_hash": row.short_hash,
@@ -484,8 +426,7 @@ def _query_commits(
     owner_id: str,
     session: Session | None = None,
 ) -> tuple[int, list[dict]]:
-    """Run the filtered commits query, scoped to `owner_id`. limit=None returns
-    all matching rows."""
+    """Query one owner's commits and return the total and page."""
     with session_scope(session) as s:
         q = select(CommitRow).where(CommitRow.owner_id == owner_id)
         if since:
@@ -512,16 +453,13 @@ def _query_commits(
 
 @app.get("/health", summary="Liveness + DB readiness", tags=["health"], operation_id="health")
 def health(session: Session = Depends(get_db)):
-    """Liveness + DB readiness, for monitoring and the container healthcheck.
-    A failed DB connection raises SQLAlchemyError, mapped to 503 above."""
+    """Check process liveness and database readiness."""
     session.execute(select(1))
     return {"status": "ok"}
 
 
 async def _check_providers() -> dict[str, str]:
-    """Per-provider reachability: missing_key (no key, not a failure), ok (key
-    set + host answered), or unreachable (key set but the network call failed).
-    Reachability only — we don't spend a token validating the key."""
+    """Check configured provider hosts without making billable requests."""
     out: dict[str, str] = {}
     async with httpx.AsyncClient(timeout=5) as client:
         for name, provider in summarizer.PROVIDERS.items():
@@ -557,16 +495,7 @@ async def health_deep(
     session: Session = Depends(get_db),
     user: UserRow | None = Depends(get_optional_user),
 ):
-    """Deep health for a real uptime check: DB connectivity, a remote-reachable
-    probe against one registered repo, and provider-key reachability. Returns
-    503 if any *checked* component is down (no_repos / missing_key are not
-    failures), else 200.
-
-    The git probe is scoped to a repo the *caller* owns and the response never
-    names a specific repo, so an exposed multi_user deployment can't be used to
-    enumerate other users' repos via /health/deep. An anonymous
-    caller in multi_user mode gets `git: no_repos` — the probe is skipped
-    rather than run against an arbitrary user's repo."""
+    """Check the database, one caller-owned repo, and provider hosts."""
     components: dict[str, object] = {}
     healthy = True
 
@@ -610,15 +539,7 @@ async def health_deep(
     operation_id="list_providers",
 )
 def providers(current_user: UserRow = Depends(get_current_user)):
-    """List summary providers, their default model, and whether each is
-    configured. A client (UI/CLI) can use this to let the user pick one.
-
-    In multi_user mode this is admin-only: provider-key presence is an
-    information-disclosure surface on an exposed deployment. The status
-    shown is the *calling admin's* per-user view (their own
-    ``provider_keys`` rows + the env-var fallback), so the admin sees
-    what they personally can use. In off/single_user mode it's the
-    env-var view and is open as before."""
+    """List available providers and the caller's configuration status."""
     if config.AUTH_MODE == "multi_user" and not current_user.is_admin:
         raise HTTPException(status_code=403, detail="Admin only")
     if config.AUTH_MODE == "multi_user":
@@ -630,10 +551,6 @@ def providers(current_user: UserRow = Depends(get_current_user)):
 
 
 # --- Auth (multi_user only) -------------------------------------------------
-# The login/logout/redeem flow only exists in multi_user mode. In off and
-# single_user mode there's no login concept, so these routes 404 — the auth
-# machinery is still exercised by single_user (sessions, hashing) but the user
-# never reaches these handlers.
 
 
 def _require_multi_user() -> None:
@@ -651,9 +568,7 @@ def _user_to_dict(user: UserRow) -> dict:
 
 
 def _user_admin_to_dict(user: UserRow) -> dict:
-    """Full user dict for the admin /admin/users view — adds is_active, the
-    login/lockout counters, and timestamps that the self-view deliberately
-    hides."""
+    """Serialize the fields visible to admins."""
     return {
         "id": user.id,
         "email": user.email,
@@ -691,14 +606,7 @@ def auth_login(
     response: Response,
     session: Session = Depends(get_db),
 ):
-    """Verify credentials, open a session, set the hardened cookie. A bad
-    email or password is an indistinguishable 401 (no account enumeration).
-    A locked account is a 423 with a Retry-After header.
-
-    Lockout: ``LOGIN_LOCKOUT_THRESHOLD`` consecutive failures trip a
-    ``LOGIN_LOCKOUT_DURATION_MINUTES``-minute lockout for the user. The
-    counter is reset on success. A locked user sees the same 401 a
-    wrong-password user does (no lockout-state leak)."""
+    """Authenticate credentials and create a cookie session."""
     _require_multi_user()
     ip = request.client.host if request.client else None
     user = session.scalar(select(UserRow).where(UserRow.email == normalize_email(req.email)))
@@ -710,9 +618,6 @@ def auth_login(
     )
     if bad:
         if user is not None and user.password_hash is not None and user.is_active:
-            # Only count a failure if the user exists with a password and
-            # is active — an unknown-email attempt is a 401 with no
-            # counter to bump (we have no user to lock out).
             record_login_failure(user, session=session)
         audit(
             "auth.login.fail",
@@ -722,10 +627,9 @@ def auth_login(
             metadata={"email": normalize_email(req.email)},
         )
         raise HTTPException(status_code=401, detail="Invalid email or password")
-    # `bad` was False, so `user` is a real active user with a password hash.
     assert user is not None
     if is_locked(user):
-        assert user.locked_until is not None  # is_locked returned True
+        assert user.locked_until is not None
         retry_after = max(1, int((_as_utc(user.locked_until) - datetime.now(UTC)).total_seconds()))
         audit(
             "auth.login.locked",
@@ -763,8 +667,7 @@ def auth_logout(
     response: Response,
     session: Session = Depends(get_db),
 ):
-    """Revoke the current session and clear the cookie. Idempotent — logging
-    out without a session is still a 200."""
+    """Revoke the current session and clear its cookie."""
     _require_multi_user()
     sid = request.cookies.get(config.SESSION_COOKIE_NAME)
     if sid:
@@ -791,9 +694,7 @@ def auth_redeem_invite(
     response: Response,
     session: Session = Depends(get_db),
 ):
-    """Claim a single-use invite: create the account, set its password, mark
-    the invite used, and log the new user straight in (sets the session
-    cookie). This is the no-auth bootstrap path the CLI drives."""
+    """Redeem an invite and start the new user's session."""
     _require_multi_user()
     ip = request.client.host if request.client else None
     invite = session.scalar(select(InviteRow).where(InviteRow.token == req.token))
@@ -849,11 +750,7 @@ def auth_redeem_invite(
     return _user_to_dict(user)
 
 
-# Friendly alias so the SPA can POST /signup (the URL a user would type). The
-# handler is the one bound to /auth/redeem-invite above; aliasing the function
-# under a second route keeps a single source of truth (no duplicated logic).
-# CSRF allowlist includes /signup so the SPA can post it without the
-# ``X-Requested-With`` header that a freshly-loaded form won't have yet.
+# User-facing alias for invite redemption.
 app.post(
     "/signup",
     status_code=201,
@@ -865,8 +762,7 @@ app.post(
 
 @app.get("/auth/me", summary="Current user", tags=["auth"], operation_id="auth_me")
 def auth_me(current_user: UserRow = Depends(get_current_user)):
-    """The current user, for the SPA's 'logged in as' indicator and to let the
-    CLI verify a stored session is still valid."""
+    """Return the current user."""
     return _user_to_dict(current_user)
 
 
@@ -886,11 +782,7 @@ def auth_change_password(
     session: Session = Depends(get_db),
     current_user: UserRow = Depends(get_current_user),
 ):
-    """Self-service password change. Verifies the current password, hashes
-    the new one, and revokes all of the user's *other* sessions (a stolen
-    cookie stops working). The current session is kept so the user isn't
-    logged out of the page that triggered the change. 401 on a wrong
-    current password; 404 in off/single_user mode."""
+    """Change the password and revoke the user's other sessions."""
     _require_multi_user()
     if not verify_password(req.current_password, current_user.password_hash or ""):
         raise HTTPException(status_code=401, detail="Current password is incorrect")
@@ -907,17 +799,10 @@ def auth_change_password(
 
 
 # --- Password reset ---------------------------------------------------------
-# Two ways in: the self-serve flow (user asks, gets an email) and the
-# admin-mediated flow (admin mints a token, useful when the user can't
-# receive mail). Both land on POST /auth/password-reset/confirm to redeem.
-# 15-minute expiry; on success every session is revoked and the lockout
-# is cleared.
 
 
 def _reset_link(request: Request, token: str) -> str:
-    """Build the reset link the email points at. PUBLIC_URL wins; otherwise
-    fall back to the request's own origin so a single-host deploy needs no
-    config. The path is the SPA's /password-reset page, which reads ?token."""
+    """Build a password-reset URL from PUBLIC_URL or the request origin."""
     base = config.PUBLIC_URL or str(request.base_url).rstrip("/")
     return f"{base}/password-reset?token={token}"
 
@@ -934,10 +819,7 @@ def auth_request_password_reset(
     request: Request,
     session: Session = Depends(get_db),
 ):
-    """Self-serve password reset. Mints a one-time, 15-minute token for the
-    account and emails the reset link. Always returns 204 — even when the
-    email doesn't exist or the account is inactive — so it can't be used to
-    enumerate accounts. Public (no session) and CSRF-exempt, like login."""
+    """Email a reset link without disclosing whether the account exists."""
     _require_multi_user()
     ip = request.client.host if request.client else None
     user = session.scalar(select(UserRow).where(UserRow.email == normalize_email(req.email)))
@@ -971,10 +853,7 @@ def admin_reset_password(
     session: Session = Depends(get_db),
     current_user: UserRow = Depends(get_current_user),
 ):
-    """Mint a one-time password-reset token for ``user_id``. Admin-only.
-    Returns the token and its expiry; the admin delivers the token out
-    of band (the email-delivered story is a 0.6.0 follow-up). 404 if
-    the user doesn't exist."""
+    """Mint a one-time reset token for a user."""
     _require_admin(current_user)
     target = session.get(UserRow, user_id)
     if target is None:
@@ -1002,10 +881,7 @@ def auth_reset_password_confirm(
     req: PasswordResetConfirm,
     request: Request,
 ):
-    """Redeem a reset token. Public (no session required) and in the CSRF
-    allowlist for the same reason as /auth/login — a freshly-loaded
-    redemption form has no session cookie to defend. On success every
-    session for the user is revoked and the lockout is cleared."""
+    """Redeem a reset token and revoke the user's sessions."""
     _require_multi_user()
     user_id = redeem_password_reset(req.token, new_password=req.new_password)
     if user_id is None:
@@ -1020,10 +896,6 @@ def auth_reset_password_confirm(
 
 
 # --- API keys (Bearer auth) -------------------------------------------------
-# Per-user long-lived keys for the CLI. The full key material is shown
-# exactly once on creation; only the argon2id hash is persisted. Issue is
-# throttled at API_KEY_ISSUE_LIMIT per API_KEY_ISSUE_WINDOW_HOURS via a
-# per-user count over api_keys, windowed at query time.
 
 
 def _api_key_to_dict(row: ApiKeyRow) -> dict:
@@ -1063,10 +935,7 @@ def create_api_key(
     session: Session = Depends(get_db),
     current_user: UserRow = Depends(get_current_user),
 ):
-    """Mint a new per-user API key. The full key is returned in the
-    response and never again — callers must store it in their secret
-    manager immediately. Rate limited to
-    ``API_KEY_ISSUE_LIMIT`` per user per ``API_KEY_ISSUE_WINDOW_HOURS``."""
+    """Create a rate-limited API key and return its plaintext once."""
     _require_multi_user()
     recent = session.scalar(
         select(func.count())
@@ -1105,8 +974,7 @@ def list_api_keys(
     session: Session = Depends(get_db),
     current_user: UserRow = Depends(get_current_user),
 ):
-    """List the caller's API keys. The hashed key material is never
-    returned — only metadata (id, name, prefix, timestamps, revoked)."""
+    """List the caller's API key metadata."""
     _require_multi_user()
     rows = session.scalars(
         select(ApiKeyRow)
@@ -1129,7 +997,7 @@ def revoke_api_key_endpoint(
     session: Session = Depends(get_db),
     current_user: UserRow = Depends(get_current_user),
 ):
-    """Revoke a key. Idempotent (already-revoked or unknown id is a 204)."""
+    """Idempotently revoke an API key."""
     _require_multi_user()
     if revoke_api_key(key_id, user_id=current_user.id):
         audit(
@@ -1164,8 +1032,7 @@ def admin_unlock_user(
     session: Session = Depends(get_db),
     current_user: UserRow = Depends(get_current_user),
 ):
-    """Clear the lockout and failure counter for `user_id`. Admin only.
-    204 on success, 404 if the user doesn't exist."""
+    """Clear a user's login lockout."""
     _require_admin(current_user)
     target = session.get(UserRow, user_id)
     if target is None:
@@ -1193,8 +1060,7 @@ def admin_list_users(
     session: Session = Depends(get_db),
     current_user: UserRow = Depends(get_current_user),
 ):
-    """List every user, newest-first. Admin-only. `q` is a
-    case-insensitive substring match on email; limit/offset paginate."""
+    """List users, optionally filtering by email."""
     _require_admin(current_user)
     base = select(UserRow)
     if q:
@@ -1219,10 +1085,7 @@ def admin_deactivate_user(
     session: Session = Depends(get_db),
     current_user: UserRow = Depends(get_current_user),
 ):
-    """Flip is_active=False for `user_id`. Admin-only. A
-    deactivated user keeps their row but can't sign in. The calling admin
-    can't deactivate themselves (400) — that's how you lock yourself out.
-    404 on unknown user."""
+    """Deactivate a user while preventing admin self-lockout."""
     _require_admin(current_user)
     if user_id == current_user.id:
         raise HTTPException(status_code=400, detail="You cannot deactivate yourself")
@@ -1256,9 +1119,7 @@ def admin_activate_user(
     session: Session = Depends(get_db),
     current_user: UserRow = Depends(get_current_user),
 ):
-    """Flip is_active=True for `user_id`. Admin-only. The
-    reverse of /deactivate — lets an admin bring a deactivated user
-    back. 404 on unknown user."""
+    """Reactivate a user."""
     _require_admin(current_user)
     target = session.get(UserRow, user_id)
     if target is None:
@@ -1293,8 +1154,7 @@ def admin_create_invite(
     session: Session = Depends(get_db),
     current_user: UserRow = Depends(get_current_user),
 ):
-    """Issue a new invite. Admin-only. The redeem token is returned in the
-    response so the admin can deliver it out of band."""
+    """Create an invite and return its redemption token."""
     _require_admin(current_user)
     if req.role not in ("user", "admin"):
         raise HTTPException(status_code=400, detail="role must be 'user' or 'admin'")
@@ -1342,8 +1202,7 @@ def admin_list_audit(
     session: Session = Depends(get_db),
     current_user: UserRow = Depends(get_current_user),
 ):
-    """Paginated read of the audit log. Admin-only. Filters: `since`
-    (inclusive on created_at), `action` (exact match). Newest first."""
+    """List audit events with optional time and action filters."""
     _require_admin(current_user)
     q = select(AuditLogRow)
     if since is not None:
@@ -1394,16 +1253,7 @@ def get_provider_keys(
     session: Session = Depends(get_db),
     current_user: UserRow = Depends(get_current_user),
 ):
-    """Which providers the caller has configured, plus the catalogue of
-    provider names a client needs to render a key form. The raw key material
-    is never returned — only the provider name and timestamps.
-
-    The catalogue is names only. Whether a provider has a key configured is an
-    information-disclosure surface (docs/security.md), which is why /providers
-    is admin-only in multi_user; this route is open to every authenticated user,
-    so it must not carry that. Revoked rows are returned as-is: `revoked_at`
-    non-null means *not* configured, and it's what a client shows after a
-    revoke."""
+    """List provider names and the caller's key metadata, never key values."""
     _require_multi_user()
     rows = session.scalars(
         select(ProviderKeyRow)
@@ -1411,8 +1261,6 @@ def get_provider_keys(
         .order_by(ProviderKeyRow.provider)
     ).all()
     return {
-        # Module attribute, not a from-import: LLM_LOCAL_ONLY is read once at
-        # import time, so tests monkeypatch summarizer.PROVIDERS itself.
         "providers": list(summarizer.PROVIDERS),
         "default": summarizer.default_provider(),
         "keys": [_provider_key_to_dict(r) for r in rows],
@@ -1431,10 +1279,7 @@ def upsert_provider_key(
     session: Session = Depends(get_db),
     current_user: UserRow = Depends(get_current_user),
 ):
-    """Set (or clear) a per-user provider key. The raw key is encrypted
-    at rest with Fernet; the master key is the SHA-256 of
-    ``SECRETS_ENCRYPTION_KEY`` (see ``surgite.secrets``). The response
-    is just a confirmation — the key material is never echoed back."""
+    """Encrypt and store, replace, or revoke a provider key."""
     _require_multi_user()
     if req.provider not in summarizer.PROVIDERS:
         raise HTTPException(
@@ -1488,9 +1333,7 @@ def upsert_provider_key(
 def _get_prompt_setting(
     session: Session, repo_id: int | None, owner_id: str
 ) -> PromptSettingsRow | None:
-    """The settings row for `owner_id` scoped to `repo_id` (or the owner's
-    global row for None). No fallback — returns None when this exact scope has
-    no row yet."""
+    """Return the exact prompt-settings row without fallback."""
     return session.scalar(
         select(PromptSettingsRow).where(
             PromptSettingsRow.repo_id == repo_id,
@@ -1515,9 +1358,7 @@ def _get_or_create_prompt_setting(
 
 
 def _resolve_settings_dict(session: Session, repo_id: int | None, owner_id: str) -> dict:
-    """Settings that apply to `repo_id` for `owner_id`: its own row if it has
-    one, else the owner's global default. This is the lookup the summarizer
-    uses per repo."""
+    """Resolve repo prompt settings with global fallback."""
     row = _get_prompt_setting(session, repo_id, owner_id) if repo_id is not None else None
     if row is None:
         row = _get_or_create_prompt_setting(owner_id, session, repo_id=None)
@@ -1548,9 +1389,7 @@ def get_prompt_settings(
     session: Session = Depends(get_db),
     current_user: UserRow = Depends(get_current_user),
 ):
-    """Return the prompt settings for `repo_id`. If that repo has no row of its
-    own, return the global default (its `repo_id` will be null, signalling the
-    UI that the values are inherited rather than repo-specific)."""
+    """Return repo prompt settings with global fallback."""
     row = _get_prompt_setting(session, repo_id, current_user.id) if repo_id is not None else None
     if row is None:
         row = _get_or_create_prompt_setting(current_user.id, session, repo_id=None)
@@ -1569,9 +1408,7 @@ def update_prompt_settings(
     session: Session = Depends(get_db),
     current_user: UserRow = Depends(get_current_user),
 ):
-    """Upsert the prompt settings for the caller, optionally scoped to a repo
-    they own (`repo_id`). Only the provided fields are changed. 404 if
-    `repo_id` is given but the caller doesn't own that repo."""
+    """Update global or repo-specific prompt settings."""
     if repo_id is not None and _owned_repo(session, repo_id, current_user.id) is None:
         raise HTTPException(status_code=404, detail="Repo not found")
 
@@ -1603,9 +1440,7 @@ def list_commits(
     session: Session = Depends(get_db),
     current_user: UserRow = Depends(get_current_user),
 ):
-    """Paginated, filterable list of the caller's ingested commits. Filters:
-    `since`/`until` (inclusive dates), `author` (substring), `repo` (name).
-    Newest first. Scoped to the caller's own repos."""
+    """List the caller's commits with filters and pagination."""
     total, commits = _query_commits(
         since, until, author, repo, limit, offset, current_user.id, session=session
     )
@@ -1628,9 +1463,7 @@ def get_commit(
     session: Session = Depends(get_db),
     current_user: UserRow = Depends(get_current_user),
 ):
-    """Resolve a full or abbreviated (>=7 hex chars) commit hash to one of the
-    caller's commits. 400 on a malformed hash, 404 if no match, 409 if an
-    abbreviation matches more than one commit."""
+    """Resolve a full or abbreviated hash within the caller's commits."""
     if not _looks_like_hash(hash):
         raise HTTPException(
             status_code=400,
@@ -1665,8 +1498,7 @@ def get_commit(
 def _aggregate_commits(
     commits: list[dict],
 ) -> tuple[dict[str, int], dict[str, int], dict[str, list[Commit]]]:
-    """Roll a list of commit dicts up into the per-repo and per-day counts the
-    summary view needs, plus the Commit objects grouped by repo for the log."""
+    """Aggregate commit counts and group commits by repo."""
     by_repo: dict[str, int] = defaultdict(int)
     by_day: dict[str, int] = defaultdict(int)
     repo_commits: dict[str, list[Commit]] = {}
@@ -1683,12 +1515,7 @@ def _aggregate_commits(
 def _source_sync_snapshot(
     session: Session, owner_id: str, repo: str | None
 ) -> dict[str, str | None]:
-    """Capture repository ingest times before reading commits.
-
-    A concurrent ingest can only make this conservative: the UI may ask for a
-    refresh unnecessarily, but it never presents a summary as having used a
-    source snapshot newer than its commit query.
-    """
+    """Capture conservative ingest times before querying commits."""
     query = select(RepoRow).where(RepoRow.owner_id == owner_id)
     if repo is not None:
         query = query.where(RepoRow.name == repo)
@@ -1795,13 +1622,7 @@ def _prepare_summary(
 async def _check_ai_preconditions(
     request: Request, provider: str | None, total: int, *, user_id: str
 ):
-    """Shared gate for the AI paths: per-user + per-IP-outer rate limit.
-    The per-user 5/60s bucket is the primary throttle — one user can't
-    burn the LLM budget for everyone. The 100/60s per-IP
-    outer is the backstop for the "fresh signup spam" case (an attacker
-    cycling accounts can't share a per-user bucket because they have no
-    user yet). Raises the appropriate HTTPException; returns the resolved
-    provider on success."""
+    """Apply AI limits and resolve the provider credentials."""
     check_summary_user_limit(request, user_id=user_id)
     check_ip_outer_rate_limit(request)
     if total > AI_SUMMARY_MAX_COMMITS:
@@ -1816,7 +1637,6 @@ async def _check_ai_preconditions(
         resolved = summarizer.resolve_provider(provider)
     except ProviderError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
-    # _resolve_key handles the per-user DB row vs env-var fallback.
     try:
         from surgite.summarizer import _resolve_key
 
@@ -1845,16 +1665,7 @@ async def summary(
     session: Session = Depends(get_db),
     current_user: UserRow = Depends(get_current_user),
 ):
-    """Commit summary for the period. With ai=true, returns one AI summary per
-    repo (ai_summaries); the additional whole-log summary (ai_summary) costs an
-    extra provider call and is only generated when combined=true.
-
-    The raw `commits` list is omitted by default (it can be hundreds of KB the
-    web UI never renders); pass commits=true to include it, or use /commits.
-
-    This is a pure read against the DB; freshness is owned by the background
-    ingest scheduler (see _scheduler_loop) and the per-repo BackgroundTask
-    on POST /repos. No git fetch happens here."""
+    """Summarize stored commits, optionally with per-repo AI output."""
     prepared = await asyncio.to_thread(
         _prepare_summary,
         since=since,
@@ -1938,15 +1749,7 @@ async def summary_stream(
     session: Session = Depends(get_db),
     current_user: UserRow = Depends(get_current_user),
 ):
-    """Server-sent-events variant of /summary?ai=true. Emits a `meta` event
-    (the same stats/log payload /summary returns) followed by per-repo `delta`
-    events as the provider streams tokens, a `repo_done`/`repo_error` per repo,
-    and a final `done`. The UI fills each card in as text arrives instead of
-    blocking on a spinner for the whole fan-out.
-
-    All DB reads happen up front: the StreamingResponse generator runs after
-    the request handler returns and the Depends-injected session is closed, so
-    it must only touch the provider, never the DB."""
+    """Stream per-repo AI summaries as server-sent events."""
     prepared = await asyncio.to_thread(
         _prepare_summary,
         since=since,
@@ -2058,7 +1861,7 @@ def list_repos(
     session: Session = Depends(get_db),
     current_user: UserRow = Depends(get_current_user),
 ):
-    """List the repos the caller has registered, with ingest timestamps."""
+    """List the caller's registered repos."""
     rows = session.scalars(select(RepoRow).where(RepoRow.owner_id == current_user.id)).all()
     interval = _ingest_interval_seconds()
     return {
@@ -2082,10 +1885,7 @@ def create_repo(
     session: Session = Depends(get_db),
     current_user: UserRow = Depends(get_current_user),
 ):
-    """Register a new repo. In multi_user mode with
-    ``REPO_ADD_GLOBAL_ONLY=true`` only admins can add — the clone-url path
-    is a code-execution surface and the operator probably wants to gate it.
-    The default is open to every authenticated user (the 0.4.0 UX)."""
+    """Register a remote repo and queue its initial ingest."""
     from surgite.git import _repo_name_from_url, is_remote_url
 
     if config.REPO_ADD_GLOBAL_ONLY and not current_user.is_admin:
@@ -2164,8 +1964,7 @@ def delete_repo(
     session: Session = Depends(get_db),
     current_user: UserRow = Depends(get_current_user),
 ):
-    """Remove a repo the caller owns (and its commits cascade). 404 if the
-    repo doesn't exist or isn't owned by the caller."""
+    """Delete an owned repo and its commits."""
     repo = _owned_repo(session, repo_id, current_user.id)
     if not repo:
         raise HTTPException(status_code=404, detail="Repo not found")
@@ -2185,10 +1984,7 @@ def create_share(
     session: Session = Depends(get_db),
     current_user: UserRow = Depends(get_current_user),
 ):
-    """Persist the parameters of a summary behind a short slug. The slug is the
-    only secret guarding it — resolving /summaries/{slug} re-runs the query.
-    The share records its creator (`owner_id`), which GET /summaries/{slug}
-    checks — a non-owner gets the same 404 an unknown slug does."""
+    """Save summary parameters behind an owner-scoped slug."""
     now = datetime.now(UTC)
     slug = secrets.token_urlsafe(8)
     row = SharedSummaryRow(
@@ -2214,9 +2010,7 @@ def _share_to_dict(row: SharedSummaryRow) -> dict:
 
 
 def _as_utc(dt: datetime) -> datetime:
-    """Treat a tz-naive datetime as UTC. Postgres returns aware datetimes for
-    our timezone=True columns, but SQLite (the test DB) hands back naive ones —
-    normalise so the expiry comparison works on both."""
+    """Treat SQLite's naive datetimes as UTC."""
     return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
 
 
@@ -2232,8 +2026,7 @@ def list_my_shares(
     session: Session = Depends(get_db),
     current_user: UserRow = Depends(get_current_user),
 ):
-    """The caller's saved shares, newest first. Expired shares are
-    excluded — they're not resolvable, so showing them is dead UI."""
+    """List the caller's unexpired shares."""
     now = datetime.now(UTC)
     base = select(SharedSummaryRow).where(
         SharedSummaryRow.owner_id == current_user.id,
@@ -2257,10 +2050,7 @@ def get_share(
     session: Session = Depends(get_db),
     current_user: UserRow = Depends(get_current_user),
 ):
-    """Resolve a slug to its stored summary params. 404 for unknown,
-    expired, OR not-owned-by-the-caller slugs. The 404-not-403 is
-    deliberate: a 403 would tell an attacker "this slug exists, you just
-    can't see it", which is an enumeration vector."""
+    """Resolve an unexpired, caller-owned share without leaking other slugs."""
     row = session.get(SharedSummaryRow, slug)
     if (
         row is None
@@ -2271,9 +2061,7 @@ def get_share(
     return _share_to_dict(row)
 
 
-# Serve the built SvelteKit SPA same-origin in production. Mounted LAST so it never
-# shadows the API routes above, and only when the build exists (in dev the frontend
-# runs on the Vite server instead, so this is skipped and startup doesn't fail).
+# Mount the production SPA last so it cannot shadow API routes.
 _FRONTEND_BUILD = Path(__file__).resolve().parent.parent / "frontend" / "build"
 
 
@@ -2284,25 +2072,19 @@ _FRONTEND_BUILD = Path(__file__).resolve().parent.parent / "frontend" / "build"
     operation_id="share_page",
 )
 def share_page(slug: str):
-    """Serve the SPA shell for a shared-summary deep link so a hard refresh on
-    /s/{slug} works. The client-side route reads the slug and re-runs the
-    query via GET /summaries/{slug}. In dev (no build) the Vite server handles
-    this route instead, so a 404 here is correct."""
+    """Serve the SPA shell for a shared-summary deep link."""
     return _serve_spa_shell()
 
 
 @app.get("/login", summary="Login SPA shell", tags=["ui"], operation_id="login_page")
 def login_page():
-    """SPA shell for /login. The client-side route renders the login form. In
-    dev (no build) the Vite server handles this route instead."""
+    """Serve the login SPA shell."""
     return _serve_spa_shell()
 
 
 @app.get("/signup", summary="Signup SPA shell", tags=["ui"], operation_id="signup_page")
 def signup_page():
-    """SPA shell for /signup. The client-side route reads ``?token=...`` from
-    the query string and renders the redemption form. In dev (no build) the
-    Vite server handles this route instead."""
+    """Serve the signup SPA shell."""
     return _serve_spa_shell()
 
 

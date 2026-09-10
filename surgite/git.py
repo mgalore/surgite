@@ -10,17 +10,12 @@ REMOTE_PATTERNS = re.compile(r"^(https?://|git@|git://|ssh://)")
 
 
 def is_remote_url(path: str) -> bool:
-    """Detect if a path looks like a remote git URL."""
+    """Return whether a path looks like a remote Git URL."""
     return bool(REMOTE_PATTERNS.match(path))
 
 
 def _repo_name_from_url(url: str) -> str:
-    """Extract a human-friendly repo name from a remote URL.
-    Examples:
-      https://github.com/user/repo.git -> repo
-      git@github.com:user/repo.git -> repo
-      https://github.com/user/repo -> repo
-    """
+    """Extract a repository name from a remote URL."""
     name = url.rstrip("/")
     if name.endswith(".git"):
         name = name[:-4]
@@ -31,17 +26,7 @@ def _repo_name_from_url(url: str) -> str:
 
 
 def ensure_repo(name: str, url: str, cache_dir: str, timeout: int = 120) -> str:
-    """Ensure a remote repo is cloned. Returns the local path.
-
-    Clones with ``--filter=blob:none``: the full commit history arrives, but
-    file contents are fetched only when something asks for them. Ingest reads
-    commit metadata, so in practice it never asks. This is what a depth or
-    date bound would otherwise be for, without the truncation -- a bound on
-    commit count silently drops commits from a busy repo, and a bound on time
-    makes ``clone`` fail outright ("no commits selected for shallow requests")
-    on a repo that has been dormant for longer than the window. A server too
-    old for partial clone just sends everything, which is correct and slower.
-    """
+    """Clone or update a metadata-only repository cache."""
     dest = os.path.join(cache_dir, name)
     Path(cache_dir).mkdir(parents=True, exist_ok=True)
 
@@ -54,11 +39,7 @@ def ensure_repo(name: str, url: str, cache_dir: str, timeout: int = 120) -> str:
             check=True,
             timeout=timeout,
         )
-        # `git fetch` does not update origin/HEAD, so a repo that renamed its
-        # default branch (master -> main) would keep resolving to the old one.
-        # -a re-queries the remote; -d would delete the ref and break the
-        # reset below. Unchecked: an older git or a remote without a default
-        # branch leaves the existing ref in place, which is what we want.
+        # Refresh origin/HEAD in case the default branch changed.
         subprocess.run(
             ["git", "remote", "set-head", "origin", "-a"],
             cwd=dest,
@@ -86,9 +67,7 @@ def ensure_repo(name: str, url: str, cache_dir: str, timeout: int = 120) -> str:
 
 
 def ls_remote(url: str, timeout: int = 10) -> None:
-    """Cheaply check a remote is reachable without cloning. Runs
-    `git ls-remote --heads <url>` and raises RuntimeError on a non-zero exit
-    (auth failure, DNS, network) or timeout. Used by the deep health check."""
+    """Check remote reachability without cloning."""
     try:
         result = subprocess.run(
             ["git", "ls-remote", "--heads", url],
@@ -120,11 +99,7 @@ def get_raw_log(
     since_commit: str | None = None,
     timeout: int = 120,
 ) -> str:
-    """
-    args: repo_path, since, until, author, since_commit
-
-    Fetches the specified raw git logs.
-    """
+    """Return the requested raw Git log."""
     cmd = ["git", "log", "--pretty=format:%H\x1f%ad\x1f%an\x1f%s", "--date=short"]
 
     until_is_ref = _is_git_ref(repo_path, until, timeout)
@@ -148,9 +123,9 @@ def get_raw_log(
 
     result = subprocess.run(
         cmd,
-        text=True,  # necessary to get a usable output
+        text=True,
         capture_output=True,
-        cwd=repo_path,  # Without this, git log runs in whatever directory you're in
+        cwd=repo_path,
         timeout=timeout,
     )
     if result.returncode != 0:
@@ -159,11 +134,7 @@ def get_raw_log(
 
 
 def parse_log(raw_log: str) -> list[Commit]:
-    """
-    args: raw_log
-
-    Parses the raw git log into a list of Commit objects.
-    """
+    """Parse raw Git log records into commits."""
     lines = raw_log.splitlines()
     commits = []
     for line in lines:

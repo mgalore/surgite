@@ -1,8 +1,4 @@
-"""
-Test config. DATABASE_URL and the provider API keys must be set BEFORE any
-`surgite.*` import, because `surgite.config` reads them at module-load time and
-`surgite.db` creates the engine at module-load time.
-"""
+"""Shared test configuration and fixtures."""
 
 import os
 import tempfile
@@ -13,20 +9,13 @@ _db_file = Path(tempfile.gettempdir()) / "surgite_test.db"
 if _db_file.exists():
     _db_file.unlink()
 os.environ["DATABASE_URL"] = f"sqlite:///{_db_file}"
-# Force every provider key empty so ai-summary tests see "not set" regardless of
-# the developer's .env. load_dotenv() in surgite.config respects pre-existing
-# env vars and won't override these.
+# Set import-time configuration before importing surgite.
 os.environ["GROQ_API_KEY"] = ""
 os.environ["DEEPSEEK_API_KEY"] = ""
 os.environ["ANTHROPIC_API_KEY"] = ""
 os.environ["LOCAL_API_KEY"] = ""
 os.environ["LOCAL_BASE_URL"] = ""
-# Keep the full provider registry regardless of the developer's .env: with
-# LLM_LOCAL_ONLY set, summarizer.PROVIDERS would shrink to one at import time.
 os.environ["LLM_LOCAL_ONLY"] = ""
-# Disable the background ingest scheduler in tests by default. A single test
-# (test_scheduler_runs_periodically) opts back in via the
-# `client_with_scheduler` fixture.
 os.environ["INGEST_INTERVAL"] = "0"
 
 import pytest
@@ -72,7 +61,7 @@ def _schema():
 def _clean_tables():
     yield
     with get_session() as s:
-        # Children first, then the auth parents (FKs cascade, but be explicit).
+        # Delete in foreign-key order.
         s.query(CommitRow).delete()
         s.query(SharedSummaryRow).delete()
         s.query(PromptSettingsRow).delete()
@@ -84,16 +73,12 @@ def _clean_tables():
         s.query(InviteRow).delete()
         s.query(OrgMemberRow).delete()
         s.query(UserRow).delete()
-        # Orgs last: users.personal_org_id references orgs, so users must go first.
         s.query(OrgRow).delete()
         s.commit()
 
 
 @pytest.fixture(autouse=True)
 def _reset_rate_limit_buckets():
-    """The rate limiter is process-local. Without this, tests that hit
-    /summary?ai=true in succession would start hitting 429s after the 5th
-    call, regardless of which test made the earlier ones."""
     from surgite import rate_limit
 
     rate_limit._reset_for_tests()
@@ -119,10 +104,7 @@ def client():
 
 @pytest.fixture
 def client_with_scheduler(monkeypatch):
-    """A TestClient whose lifespan actually runs the background ingest
-    scheduler. Use this for tests that want to verify the scheduler is
-    firing on its timer. Sets INGEST_INTERVAL to 1 second and lets the
-    lifespan re-read it on startup."""
+    """Run TestClient with the one-second ingest scheduler enabled."""
     monkeypatch.setenv("INGEST_INTERVAL", "1")
     with TestClient(app) as c:
         yield c

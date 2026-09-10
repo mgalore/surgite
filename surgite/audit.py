@@ -1,14 +1,4 @@
-"""Audit log helpers.
-
-A thin wrapper around an append-only ``audit_log`` table. Use ``audit(...)``
-from request handlers to record security-relevant events (logins, repo
-adds, key revokes, etc.). The structured logger also emits a
-``namespace=audit`` record so log shippers see the same event in the
-standard stream.
-
-Failures here are intentionally non-fatal: an audit write that throws
-must not break the user-facing request. We log the error and move on.
-"""
+"""Non-fatal audit logging."""
 
 import logging
 from typing import Any
@@ -38,9 +28,7 @@ def audit(
     metadata: dict[str, Any] | None = None,
     session: Session | None = None,
 ) -> None:
-    """Append a row to the audit log. ``metadata`` is JSON-serialisable;
-    other string fields are truncated to sane limits (matching the
-    SessionRow/ip truncation policy)."""
+    """Persist and emit a security-relevant event."""
     row = AuditLogRow(
         actor_id=actor_id,
         action=action,
@@ -52,15 +40,12 @@ def audit(
     )
     try:
         with session_scope(session) as s:
-            # Stamp the actor's personal org (1.0.0). Pre-auth events (actor_id
-            # None) stay org-less.
             if actor_id is not None:
                 row.org_id = s.scalar(select(UserRow.personal_org_id).where(UserRow.id == actor_id))
             s.add(row)
             s.commit()
     except Exception as exc:  # noqa: BLE001 — audit must never break the caller
         log.error("audit write failed: %s", exc, extra={"action": action})
-    # Mirror to the standard log stream so log shippers see the same event.
     log.info(
         "audit %s actor=%s target=%s:%s",
         action,

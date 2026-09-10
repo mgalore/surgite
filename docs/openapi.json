@@ -2,7 +2,7 @@
   "components": {
     "schemas": {
       "ApiKeyCreate": {
-        "description": "Mint a new per-user API key. The full key is returned in the response\nexactly once.",
+        "description": "API key creation fields.",
         "properties": {
           "expires_at": {
             "anyOf": [
@@ -28,7 +28,7 @@
         "type": "object"
       },
       "ErrorResponse": {
-        "description": "The error envelope every route returns on failure. FastAPI's native\nshape — ``HTTPException(detail=...)`` and the CSRF / SQLAlchemy handlers\nin ``surgite.api`` all serialise to ``{\"detail\": \"...\"}``. Declared here\nso the OpenAPI snapshot documents the stable error contract (0.6.0\napi-stability policy).",
+        "description": "The shared API error envelope.",
         "properties": {
           "detail": {
             "title": "Detail",
@@ -55,7 +55,7 @@
         "type": "object"
       },
       "InviteCreateRequest": {
-        "description": "Create a new invite token. `email` is optional — an open invite\n(null email) can be redeemed by any new user; a pinned invite is\nlocked to one address. `role` is either ``\"user\"`` (default) or\n``\"admin\"``. The redeem token is returned in the response so the\nadmin can copy it out of band.",
+        "description": "Invite creation fields.",
         "properties": {
           "email": {
             "anyOf": [
@@ -101,7 +101,7 @@
         "type": "object"
       },
       "PasswordChange": {
-        "description": "Self-service password change. The user proves control\nof the current password; on success every other session is revoked\nand the current session is kept.",
+        "description": "Self-service password change fields.",
         "properties": {
           "current_password": {
             "title": "Current Password",
@@ -120,7 +120,7 @@
         "type": "object"
       },
       "PasswordResetConfirm": {
-        "description": "Redeem an admin-minted one-time reset token. 15-minute expiry,\none-time use; on success all of the user's sessions are revoked\nand the lockout is cleared.",
+        "description": "Password reset confirmation fields.",
         "properties": {
           "new_password": {
             "title": "New Password",
@@ -139,7 +139,7 @@
         "type": "object"
       },
       "PasswordResetRequest": {
-        "description": "Start the self-serve password reset (0.6.0). The endpoint always\nreturns 204, even for an unknown email, so this never reveals whether\nan account exists.",
+        "description": "Password reset request fields.",
         "properties": {
           "email": {
             "title": "Email",
@@ -225,7 +225,7 @@
         "type": "object"
       },
       "ProviderKeyStatus": {
-        "description": "One of the caller's provider_keys rows. Never carries key material —\nonly the provider name and the row's timestamps. A non-null ``revoked_at``\nmeans the provider is *not* configured.",
+        "description": "Provider key metadata without key material.",
         "properties": {
           "created_at": {
             "anyOf": [
@@ -261,7 +261,7 @@
         "type": "object"
       },
       "ProviderKeysResponse": {
-        "description": "The caller's own key rows plus the provider catalogue the settings form\nneeds to render. ``providers`` is the server's visible registry\n(LLM_LOCAL_ONLY filtered), deliberately without any key-presence data:\nwhether a provider *has* a key configured stays behind the admin-only\n/providers boundary. See docs/security.md.",
+        "description": "Visible providers and the caller's key metadata.",
         "properties": {
           "default": {
             "title": "Default",
@@ -291,7 +291,7 @@
         "type": "object"
       },
       "ProviderKeysUpdate": {
-        "description": "Set (or replace) a per-user provider key. The clear flag revokes the\nexisting row; the key field is required otherwise. The raw key is never\nreturned by the API.",
+        "description": "Set, replace, or revoke a provider key.",
         "properties": {
           "clear": {
             "default": false,
@@ -321,7 +321,7 @@
         "type": "object"
       },
       "RedeemInviteRequest": {
-        "description": "Claim an invite and set the new account's password. `email` is required\nonly for an open invite (one with no email pinned); for a pinned invite the\nserver uses the invite's email and ignores this field.",
+        "description": "Invite-redemption fields; open invites also require an email.",
         "properties": {
           "display_name": {
             "anyOf": [
@@ -477,7 +477,7 @@
         "type": "object"
       },
       "ShareCreate": {
-        "description": "Parameters of a summary to persist behind a shareable slug. Mirrors the\n/summary query string; all fields optional so a bare 'all repos, last 7\ndays' share is valid.",
+        "description": "Summary parameters saved behind a shareable slug.",
         "properties": {
           "ai": {
             "default": false,
@@ -558,7 +558,7 @@
   "paths": {
     "/admin/audit": {
       "get": {
-        "description": "Paginated read of the audit log. Admin-only. Filters: `since`\n(inclusive on created_at), `action` (exact match). Newest first.",
+        "description": "List audit events with optional time and action filters.",
         "operationId": "admin_list_audit",
         "parameters": [
           {
@@ -646,7 +646,7 @@
     },
     "/admin/invites": {
       "post": {
-        "description": "Issue a new invite. Admin-only. The redeem token is returned in the\nresponse so the admin can deliver it out of band.",
+        "description": "Create an invite and return its redemption token.",
         "operationId": "admin_create_invite",
         "requestBody": {
           "content": {
@@ -686,7 +686,7 @@
     },
     "/admin/users": {
       "get": {
-        "description": "List every user, newest-first. Admin-only. `q` is a\ncase-insensitive substring match on email; limit/offset paginate.",
+        "description": "List users, optionally filtering by email.",
         "operationId": "admin_list_users",
         "parameters": [
           {
@@ -757,7 +757,7 @@
     },
     "/admin/users/{user_id}/activate": {
       "post": {
-        "description": "Flip is_active=True for `user_id`. Admin-only. The\nreverse of /deactivate — lets an admin bring a deactivated user\nback. 404 on unknown user.",
+        "description": "Reactivate a user.",
         "operationId": "admin_activate_user",
         "parameters": [
           {
@@ -793,7 +793,7 @@
     },
     "/admin/users/{user_id}/deactivate": {
       "post": {
-        "description": "Flip is_active=False for `user_id`. Admin-only. A\ndeactivated user keeps their row but can't sign in. The calling admin\ncan't deactivate themselves (400) — that's how you lock yourself out.\n404 on unknown user.",
+        "description": "Deactivate a user while preventing admin self-lockout.",
         "operationId": "admin_deactivate_user",
         "parameters": [
           {
@@ -829,7 +829,7 @@
     },
     "/admin/users/{user_id}/reset-password": {
       "post": {
-        "description": "Mint a one-time password-reset token for ``user_id``. Admin-only.\nReturns the token and its expiry; the admin delivers the token out\nof band (the email-delivered story is a 0.6.0 follow-up). 404 if\nthe user doesn't exist.",
+        "description": "Mint a one-time reset token for a user.",
         "operationId": "admin_reset_password",
         "parameters": [
           {
@@ -870,7 +870,7 @@
     },
     "/admin/users/{user_id}/unlock": {
       "post": {
-        "description": "Clear the lockout and failure counter for `user_id`. Admin only.\n204 on success, 404 if the user doesn't exist.",
+        "description": "Clear a user's login lockout.",
         "operationId": "admin_unlock_user",
         "parameters": [
           {
@@ -906,7 +906,7 @@
     },
     "/auth/api-keys": {
       "get": {
-        "description": "List the caller's API keys. The hashed key material is never\nreturned — only metadata (id, name, prefix, timestamps, revoked).",
+        "description": "List the caller's API key metadata.",
         "operationId": "list_api_keys",
         "responses": {
           "200": {
@@ -934,7 +934,7 @@
         ]
       },
       "post": {
-        "description": "Mint a new per-user API key. The full key is returned in the\nresponse and never again — callers must store it in their secret\nmanager immediately. Rate limited to\n``API_KEY_ISSUE_LIMIT`` per user per ``API_KEY_ISSUE_WINDOW_HOURS``.",
+        "description": "Create a rate-limited API key and return its plaintext once.",
         "operationId": "create_api_key",
         "requestBody": {
           "content": {
@@ -992,7 +992,7 @@
     },
     "/auth/api-keys/{key_id}": {
       "delete": {
-        "description": "Revoke a key. Idempotent (already-revoked or unknown id is a 204).",
+        "description": "Idempotently revoke an API key.",
         "operationId": "revoke_api_key",
         "parameters": [
           {
@@ -1028,7 +1028,7 @@
     },
     "/auth/login": {
       "post": {
-        "description": "Verify credentials, open a session, set the hardened cookie. A bad\nemail or password is an indistinguishable 401 (no account enumeration).\nA locked account is a 423 with a Retry-After header.\n\nLockout: ``LOGIN_LOCKOUT_THRESHOLD`` consecutive failures trip a\n``LOGIN_LOCKOUT_DURATION_MINUTES``-minute lockout for the user. The\ncounter is reset on success. A locked user sees the same 401 a\nwrong-password user does (no lockout-state leak).",
+        "description": "Authenticate credentials and create a cookie session.",
         "operationId": "auth_login",
         "requestBody": {
           "content": {
@@ -1086,7 +1086,7 @@
     },
     "/auth/logout": {
       "post": {
-        "description": "Revoke the current session and clear the cookie. Idempotent — logging\nout without a session is still a 200.",
+        "description": "Revoke the current session and clear its cookie.",
         "operationId": "auth_logout",
         "responses": {
           "200": {
@@ -1116,7 +1116,7 @@
     },
     "/auth/me": {
       "get": {
-        "description": "The current user, for the SPA's 'logged in as' indicator and to let the\nCLI verify a stored session is still valid.",
+        "description": "Return the current user.",
         "operationId": "auth_me",
         "responses": {
           "200": {
@@ -1146,7 +1146,7 @@
     },
     "/auth/password": {
       "put": {
-        "description": "Self-service password change. Verifies the current password, hashes\nthe new one, and revokes all of the user's *other* sessions (a stolen\ncookie stops working). The current session is kept so the user isn't\nlogged out of the page that triggered the change. 401 on a wrong\ncurrent password; 404 in off/single_user mode.",
+        "description": "Change the password and revoke the user's other sessions.",
         "operationId": "auth_change_password",
         "requestBody": {
           "content": {
@@ -1186,7 +1186,7 @@
     },
     "/auth/password-reset": {
       "post": {
-        "description": "Self-serve password reset. Mints a one-time, 15-minute token for the\naccount and emails the reset link. Always returns 204 — even when the\nemail doesn't exist or the account is inactive — so it can't be used to\nenumerate accounts. Public (no session) and CSRF-exempt, like login.",
+        "description": "Email a reset link without disclosing whether the account exists.",
         "operationId": "auth_request_password_reset",
         "requestBody": {
           "content": {
@@ -1221,7 +1221,7 @@
     },
     "/auth/password-reset/confirm": {
       "post": {
-        "description": "Redeem a reset token. Public (no session required) and in the CSRF\nallowlist for the same reason as /auth/login — a freshly-loaded\nredemption form has no session cookie to defend. On success every\nsession for the user is revoked and the lockout is cleared.",
+        "description": "Redeem a reset token and revoke the user's sessions.",
         "operationId": "auth_reset_password_confirm",
         "requestBody": {
           "content": {
@@ -1256,7 +1256,7 @@
     },
     "/auth/redeem-invite": {
       "post": {
-        "description": "Claim a single-use invite: create the account, set its password, mark\nthe invite used, and log the new user straight in (sets the session\ncookie). This is the no-auth bootstrap path the CLI drives.",
+        "description": "Redeem an invite and start the new user's session.",
         "operationId": "auth_redeem_invite",
         "requestBody": {
           "content": {
@@ -1296,7 +1296,7 @@
     },
     "/commits": {
       "get": {
-        "description": "Paginated, filterable list of the caller's ingested commits. Filters:\n`since`/`until` (inclusive dates), `author` (substring), `repo` (name).\nNewest first. Scoped to the caller's own repos.",
+        "description": "List the caller's commits with filters and pagination.",
         "operationId": "list_commits",
         "parameters": [
           {
@@ -1417,7 +1417,7 @@
     },
     "/commits/{hash}": {
       "get": {
-        "description": "Resolve a full or abbreviated (>=7 hex chars) commit hash to one of the\ncaller's commits. 400 on a malformed hash, 404 if no match, 409 if an\nabbreviation matches more than one commit.",
+        "description": "Resolve a full or abbreviated hash within the caller's commits.",
         "operationId": "get_commit",
         "parameters": [
           {
@@ -1474,7 +1474,7 @@
     },
     "/health": {
       "get": {
-        "description": "Liveness + DB readiness, for monitoring and the container healthcheck.\nA failed DB connection raises SQLAlchemyError, mapped to 503 above.",
+        "description": "Check process liveness and database readiness.",
         "operationId": "health",
         "responses": {
           "200": {
@@ -1504,7 +1504,7 @@
     },
     "/health/deep": {
       "get": {
-        "description": "Deep health for a real uptime check: DB connectivity, a remote-reachable\nprobe against one registered repo, and provider-key reachability. Returns\n503 if any *checked* component is down (no_repos / missing_key are not\nfailures), else 200.\n\nThe git probe is scoped to a repo the *caller* owns and the response never\nnames a specific repo, so an exposed multi_user deployment can't be used to\nenumerate other users' repos via /health/deep. An anonymous\ncaller in multi_user mode gets `git: no_repos` — the probe is skipped\nrather than run against an arbitrary user's repo.",
+        "description": "Check the database, one caller-owned repo, and provider hosts.",
         "operationId": "health_deep",
         "responses": {
           "200": {
@@ -1537,7 +1537,7 @@
     },
     "/login": {
       "get": {
-        "description": "SPA shell for /login. The client-side route renders the login form. In\ndev (no build) the Vite server handles this route instead.",
+        "description": "Serve the login SPA shell.",
         "operationId": "login_page",
         "responses": {
           "200": {
@@ -1567,7 +1567,7 @@
     },
     "/providers": {
       "get": {
-        "description": "List summary providers, their default model, and whether each is\nconfigured. A client (UI/CLI) can use this to let the user pick one.\n\nIn multi_user mode this is admin-only: provider-key presence is an\ninformation-disclosure surface on an exposed deployment. The status\nshown is the *calling admin's* per-user view (their own\n``provider_keys`` rows + the env-var fallback), so the admin sees\nwhat they personally can use. In off/single_user mode it's the\nenv-var view and is open as before.",
+        "description": "List available providers and the caller's configuration status.",
         "operationId": "list_providers",
         "responses": {
           "200": {
@@ -1597,7 +1597,7 @@
     },
     "/repos": {
       "get": {
-        "description": "List the repos the caller has registered, with ingest timestamps.",
+        "description": "List the caller's registered repos.",
         "operationId": "list_repos",
         "responses": {
           "200": {
@@ -1627,7 +1627,7 @@
         ]
       },
       "post": {
-        "description": "Register a new repo. In multi_user mode with\n``REPO_ADD_GLOBAL_ONLY=true`` only admins can add — the clone-url path\nis a code-execution surface and the operator probably wants to gate it.\nThe default is open to every authenticated user (the 0.4.0 UX).",
+        "description": "Register a remote repo and queue its initial ingest.",
         "operationId": "create_repo",
         "requestBody": {
           "content": {
@@ -1669,7 +1669,7 @@
     },
     "/repos/{repo_id}": {
       "delete": {
-        "description": "Remove a repo the caller owns (and its commits cascade). 404 if the\nrepo doesn't exist or isn't owned by the caller.",
+        "description": "Delete an owned repo and its commits.",
         "operationId": "delete_repo",
         "parameters": [
           {
@@ -1748,7 +1748,7 @@
     },
     "/s/{slug}": {
       "get": {
-        "description": "Serve the SPA shell for a shared-summary deep link so a hard refresh on\n/s/{slug} works. The client-side route reads the slug and re-runs the\nquery via GET /summaries/{slug}. In dev (no build) the Vite server handles\nthis route instead, so a 404 here is correct.",
+        "description": "Serve the SPA shell for a shared-summary deep link.",
         "operationId": "share_page",
         "parameters": [
           {
@@ -1789,7 +1789,7 @@
     },
     "/settings/prompt": {
       "get": {
-        "description": "Return the prompt settings for `repo_id`. If that repo has no row of its\nown, return the global default (its `repo_id` will be null, signalling the\nUI that the values are inherited rather than repo-specific).",
+        "description": "Return repo prompt settings with global fallback.",
         "operationId": "get_prompt_settings",
         "parameters": [
           {
@@ -1835,7 +1835,7 @@
         ]
       },
       "put": {
-        "description": "Upsert the prompt settings for the caller, optionally scoped to a repo\nthey own (`repo_id`). Only the provided fields are changed. 404 if\n`repo_id` is given but the caller doesn't own that repo.",
+        "description": "Update global or repo-specific prompt settings.",
         "operationId": "update_prompt_settings",
         "parameters": [
           {
@@ -1893,7 +1893,7 @@
     },
     "/settings/provider-keys": {
       "get": {
-        "description": "Which providers the caller has configured, plus the catalogue of\nprovider names a client needs to render a key form. The raw key material\nis never returned — only the provider name and timestamps.\n\nThe catalogue is names only. Whether a provider has a key configured is an\ninformation-disclosure surface (docs/security.md), which is why /providers\nis admin-only in multi_user; this route is open to every authenticated user,\nso it must not carry that. Revoked rows are returned as-is: `revoked_at`\nnon-null means *not* configured, and it's what a client shows after a\nrevoke.",
+        "description": "List provider names and the caller's key metadata, never key values.",
         "operationId": "get_provider_keys",
         "responses": {
           "200": {
@@ -1923,7 +1923,7 @@
         ]
       },
       "put": {
-        "description": "Set (or clear) a per-user provider key. The raw key is encrypted\nat rest with Fernet; the master key is the SHA-256 of\n``SECRETS_ENCRYPTION_KEY`` (see ``surgite.secrets``). The response\nis just a confirmation — the key material is never echoed back.",
+        "description": "Encrypt and store, replace, or revoke a provider key.",
         "operationId": "upsert_provider_key",
         "requestBody": {
           "content": {
@@ -1963,7 +1963,7 @@
     },
     "/signup": {
       "get": {
-        "description": "SPA shell for /signup. The client-side route reads ``?token=...`` from\nthe query string and renders the redemption form. In dev (no build) the\nVite server handles this route instead.",
+        "description": "Serve the signup SPA shell.",
         "operationId": "signup_page",
         "responses": {
           "200": {
@@ -1991,7 +1991,7 @@
         ]
       },
       "post": {
-        "description": "Claim a single-use invite: create the account, set its password, mark\nthe invite used, and log the new user straight in (sets the session\ncookie). This is the no-auth bootstrap path the CLI drives.",
+        "description": "Redeem an invite and start the new user's session.",
         "operationId": "signup",
         "requestBody": {
           "content": {
@@ -2031,7 +2031,7 @@
     },
     "/summaries": {
       "post": {
-        "description": "Persist the parameters of a summary behind a short slug. The slug is the\nonly secret guarding it — resolving /summaries/{slug} re-runs the query.\nThe share records its creator (`owner_id`), which GET /summaries/{slug}\nchecks — a non-owner gets the same 404 an unknown slug does.",
+        "description": "Save summary parameters behind an owner-scoped slug.",
         "operationId": "create_share",
         "requestBody": {
           "content": {
@@ -2071,7 +2071,7 @@
     },
     "/summaries/mine": {
       "get": {
-        "description": "The caller's saved shares, newest first. Expired shares are\nexcluded — they're not resolvable, so showing them is dead UI.",
+        "description": "List the caller's unexpired shares.",
         "operationId": "list_my_shares",
         "parameters": [
           {
@@ -2126,7 +2126,7 @@
     },
     "/summaries/{slug}": {
       "get": {
-        "description": "Resolve a slug to its stored summary params. 404 for unknown,\nexpired, OR not-owned-by-the-caller slugs. The 404-not-403 is\ndeliberate: a 403 would tell an attacker \"this slug exists, you just\ncan't see it\", which is an enumeration vector.",
+        "description": "Resolve an unexpired, caller-owned share without leaking other slugs.",
         "operationId": "get_share",
         "parameters": [
           {
@@ -2167,7 +2167,7 @@
     },
     "/summary": {
       "get": {
-        "description": "Commit summary for the period. With ai=true, returns one AI summary per\nrepo (ai_summaries); the additional whole-log summary (ai_summary) costs an\nextra provider call and is only generated when combined=true.\n\nThe raw `commits` list is omitted by default (it can be hundreds of KB the\nweb UI never renders); pass commits=true to include it, or use /commits.\n\nThis is a pure read against the DB; freshness is owned by the background\ningest scheduler (see _scheduler_loop) and the per-repo BackgroundTask\non POST /repos. No git fetch happens here.",
+        "description": "Summarize stored commits, optionally with per-repo AI output.",
         "operationId": "get_summary",
         "parameters": [
           {
@@ -2311,7 +2311,7 @@
     },
     "/summary/stream": {
       "get": {
-        "description": "Server-sent-events variant of /summary?ai=true. Emits a `meta` event\n(the same stats/log payload /summary returns) followed by per-repo `delta`\nevents as the provider streams tokens, a `repo_done`/`repo_error` per repo,\nand a final `done`. The UI fills each card in as text arrives instead of\nblocking on a spinner for the whole fan-out.\n\nAll DB reads happen up front: the StreamingResponse generator runs after\nthe request handler returns and the Depends-injected session is closed, so\nit must only touch the provider, never the DB.",
+        "description": "Stream per-repo AI summaries as server-sent events.",
         "operationId": "stream_summary",
         "parameters": [
           {

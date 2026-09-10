@@ -17,12 +17,7 @@ _GIT_RELATIVE_RE = re.compile(r"^(\d+)\.(days?|weeks?)\.ago$")
 
 
 def _resolve_since(value: str | None, default_days: int = 7) -> str:
-    """Return an ISO date string suitable for the API.
-
-    Accepts git's relative date syntax (e.g. "7.days.ago", "2.weeks.ago")
-    and plain ISO dates (e.g. "2026-08-01"). Returns the ISO date string
-    in both cases.
-    """
+    """Convert supported Git-relative dates to ISO for the API."""
     if value is None:
         return (date.today() - timedelta(days=default_days)).isoformat()
     m = _GIT_RELATIVE_RE.match(value)
@@ -39,7 +34,7 @@ def _api_base() -> str:
 
 
 def _run_local(args) -> str:
-    """Summarize a local repo path — the standalone, no-server path."""
+    """Summarize a local repository without the API."""
     raw_log = get_raw_log(
         args.repo_path,
         args.since or "7.days.ago",
@@ -55,17 +50,10 @@ def _run_local(args) -> str:
 
 
 def _run_registered(args) -> str:
-    """Pull a registered repo's data from a running surgite API instead of
-    a local clone. URL from SURGITE_API_URL. Auth (multi_user deployments) via
-    a saved session cookie (`surgite --login` / `--redeem-invite`) or
-    SURGITE_API_KEY; off/single_user deployments need none. Mirrors what the
-    web UI shows for the same repo."""
+    """Summarize a repository registered with the API."""
     base = _api_base()
     headers = cli_auth.auth_headers(base)
 
-    # The API filters by date, not git's relative syntax. Translate
-    # git's relative date forms (e.g. "7.days.ago") to ISO dates so the
-    # --help text works in both modes.
     since = _resolve_since(args.since)
     params: dict[str, str] = {"repo": args.registered, "since": since}
     if args.until:

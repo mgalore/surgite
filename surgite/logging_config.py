@@ -1,9 +1,4 @@
-"""Centralised stdlib logging configuration.
-
-Read at app startup so the container's stdout is greppable in a structured form
-when `LOG_FORMAT=json` is set, and remains human-readable otherwise. Level is
-controlled by `LOG_LEVEL` (default INFO).
-"""
+"""Application logging configuration."""
 
 import json
 import logging
@@ -12,11 +7,8 @@ import sys
 
 
 class _JsonFormatter(logging.Formatter):
-    """Emit one JSON object per record. Extra fields on the LogRecord are
-    flattened to top-level keys, which is what Loki / vector / fluentbit
-    pipelines expect."""
+    """Flatten a log record into one JSON object."""
 
-    # Standard LogRecord attributes we don't want to dump on every line.
     _RESERVED = frozenset(
         {
             "args",
@@ -61,8 +53,7 @@ class _JsonFormatter(logging.Formatter):
 
 
 def configure_logging() -> None:
-    """Install the root handler. Idempotent: re-runs (e.g. by uvicorn's
-    reload) replace the handler rather than stacking duplicates."""
+    """Replace the root handler using the current environment settings."""
     level = os.environ.get("LOG_LEVEL", "INFO").upper()
     fmt = os.environ.get("LOG_FORMAT", "").lower() == "json"
     handler = logging.StreamHandler(stream=sys.stdout)

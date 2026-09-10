@@ -1,15 +1,4 @@
-"""Auth foundation tests.
-
-Covers the password/session primitives directly and the AUTH_MODE behaviour
-through the API: off/single_user stay anonymous-equivalent, multi_user gates
-on a session cookie and isolates data per owner.
-
-The session cookie is `__Host-`-prefixed and Secure in the test config (DEBUG
-is unset), so the TestClient's cookie jar won't store or replay it over plain
-HTTP. Authenticated requests therefore send the cookie via an explicit Cookie
-header, and the login/redeem responses are checked through their Set-Cookie
-header rather than the jar.
-"""
+"""Password, session, and API authentication tests."""
 
 from datetime import UTC, datetime, timedelta
 
@@ -37,12 +26,6 @@ def multi_user(monkeypatch):
 
 
 def _cookie_header(sid: str) -> dict:
-    """Headers that carry a session cookie for an authenticated request.
-
-    In multi_user mode the SPA also sends ``X-Requested-With: surgite-web``
-    on every state-changing request (CSRF defence in depth).
-    The test client mirrors that here so the auth+CSRF combination is
-    exercised end-to-end."""
     return {
         "Cookie": f"{COOKIE}={sid}",
         "X-Requested-With": "surgite-web",

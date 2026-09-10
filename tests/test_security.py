@@ -1,18 +1,4 @@
-"""Security tests: API keys, lockout, audit, provider keys.
-
-Covers:
-  - every authed route 401s in multi_user without a session
-  - per-user API keys (POST/GET/DELETE + Bearer auth on the dep)
-  - CSRF header check on unsafe methods
-  - REPO_ADD_GLOBAL_ONLY gates POST /repos
-  - per-user + per-IP-outer rate limits on /summary?ai=true
-  - account lockout on failed logins + admin unlock
-  - shareable links user-scoped (404 cross-user)
-  - per-user provider keys in DB, encrypted at rest
-  - the rotation script (smoke test only — run against a temp DB,
-    checking the keys still decrypt)
-  - audit log + GET /admin/audit
-"""
+"""Security and authorization tests."""
 
 from __future__ import annotations
 
@@ -63,8 +49,7 @@ def _bearer_header(key: str) -> dict:
 
 
 def _make_user(email="a@example.com", password="pw-correct-horse", is_admin=False):
-    """Create a user. If the default email is already taken (a previous
-    test in the same session used it), generate a unique one."""
+    """Create a user with a unique email."""
     for attempt in range(20):
         candidate = email if attempt == 0 else f"{email.rsplit('@', 1)[0]}+{attempt}@example.com"
         with get_session() as s:
@@ -81,11 +66,7 @@ def _make_session(user_id: str) -> str:
 
 
 def test_every_documented_authed_route_requires_session(client, multi_user):
-    """In multi_user, every route except the small allowlist
-    returns 401 without a session. Unsafe methods (POST/PUT/DELETE) may
-    also 403 (the CSRF middleware fires before the auth check on those,
-    so a missing-CSRF-header request gets 403 before the no-session 401).
-    Both responses are 'not allowed', which is what we care about."""
+    """Protected routes reject requests without a session or CSRF header."""
     authed_paths = [
         ("GET", "/repos"),
         ("POST", "/repos/1/ingest"),
@@ -114,15 +95,8 @@ def test_every_documented_authed_route_requires_session(client, multi_user):
 
 
 def test_unauthed_routes_open_in_multi_user(client, multi_user):
-    """/health, /auth/login, /auth/redeem-invite, /auth/logout
-    are open in multi_user (logout is idempotent)."""
     assert client.get("/health").status_code == 200
-    # /auth/login, /logout, /redeem-invite are 4xx on bad input but
-    # not 401 — they're pre-session.
     assert client.post("/auth/login", json={"email": "x", "password": "y"}).status_code == 401
-    # NB: the 401 here is "bad credentials", not "needs auth" — they
-    # reached the handler. The CSRF middleware let them through because
-    # they're in the exempt set.
     assert client.post("/auth/logout").status_code == 200
     assert (
         client.post("/auth/redeem-invite", json={"token": "x", "password": "y"}).status_code == 400
@@ -184,9 +158,7 @@ def test_api_key_issued_once_and_verifiable(client, multi_user):
 
 
 def test_api_key_prefix_never_breaks_parsing():
-    """Regression (1.0.0): token_urlsafe prefixes could contain "_", which
-    broke verify_api_key's split-based prefix reassembly — ~8% of issued keys
-    401'd on first use. The prefix alphabet must never contain "_"."""
+    """Generated prefixes must not contain the key separator."""
     for _ in range(500):
         full, prefix, _secret = _generate_api_key()
         parts = full.split("_", 2)
@@ -278,11 +250,6 @@ def test_verify_api_key_rejects_malformed(client, multi_user):
 
 @pytest.fixture(autouse=True)
 def repo_cache(tmp_path, monkeypatch):
-    """Redirect the ingest cache to a tmp path so background tasks don't
-    try to create /var/surgite in the test environment. The
-    `_ingest_repo` helper imports ``REPO_CACHE_DIR`` from
-    ``surgite.config`` on every call, so a monkeypatch on the module
-    attribute is enough."""
     cache_dir = str(tmp_path / "repos")
     monkeypatch.setattr(config, "REPO_CACHE_DIR", cache_dir)
 
@@ -573,8 +540,6 @@ def test_provider_key_set_then_list(client, multi_user):
 
 
 def test_provider_keys_list_carries_the_visible_registry(client, multi_user):
-    """The list response is the caller's rows plus the provider catalogue a
-    client needs to render a form — nothing else."""
     sid = _make_session(_make_user())
     r = client.get("/settings/provider-keys", headers=_cookie_header(sid))
     assert r.status_code == 200
@@ -585,13 +550,7 @@ def test_provider_keys_list_carries_the_visible_registry(client, multi_user):
 
 
 def test_provider_keys_list_hides_operator_key_presence(client, multi_user, monkeypatch):
-    """The catalogue must not leak whether the *operator* configured a key.
-
-    That's the /providers disclosure (docs/security.md), and /providers is
-    admin-only in multi_user precisely because of it. This route is open to
-    every authenticated user, so the response has to be identical either way —
-    which is what stops a future refactor reaching for provider_status_for().
-    """
+    """Provider-key settings must not expose operator key availability."""
     sid = _make_session(_make_user())
     monkeypatch.delenv("GROQ_API_KEY", raising=False)
     without = client.get("/settings/provider-keys", headers=_cookie_header(sid)).json()
@@ -603,9 +562,6 @@ def test_provider_keys_list_hides_operator_key_presence(client, multi_user, monk
 
 
 def test_provider_keys_list_respects_local_only(client, multi_user, monkeypatch):
-    """LLM_LOCAL_ONLY drops the hosted providers, so the form can only offer
-    `local`. Patch the registry, not the env var: _visible() runs once at
-    import (see tests/test_summarizer.py)."""
     monkeypatch.setattr(summarizer, "PROVIDERS", {"local": summarizer._ALL_PROVIDERS["local"]})
     sid = _make_session(_make_user())
     r = client.get("/settings/provider-keys", headers=_cookie_header(sid))
@@ -613,8 +569,6 @@ def test_provider_keys_list_respects_local_only(client, multi_user, monkeypatch)
 
 
 def test_provider_keys_list_reports_revoked_rows(client, multi_user):
-    """A cleared key stays in the list with revoked_at set, rather than
-    vanishing — that timestamp is the client's post-revoke confirmation."""
     sid = _make_session(_make_user())
     client.put(
         "/settings/provider-keys",
@@ -632,18 +586,14 @@ def test_provider_keys_list_reports_revoked_rows(client, multi_user):
 
 
 def test_provider_keys_404_outside_multi_user(client):
-    """_require_multi_user 404s in off/single_user. This is the signal the SPA
-    probes to decide whether to show the provider-keys settings at all."""
     r = client.get("/settings/provider-keys")
     assert r.status_code == 404
 
 
 def test_per_user_provider_status_in_multi_user(client, multi_user, monkeypatch):
-    """An admin's /providers call reflects their own key (or env-var
-    fallback) — not a global view."""
+    """Provider availability is scoped to the calling admin."""
     admin = _make_user(is_admin=True)
     sid = _make_session(admin)
-    # No keys set, no env vars: nothing available.
     r = client.get("/providers", headers=_cookie_header(sid))
     assert r.status_code == 200
     statuses = {p["name"]: p["available"] for p in r.json()["providers"]}
@@ -739,10 +689,7 @@ def test_audit_endpoint_requires_admin_in_multi_user(client, multi_user):
 
 
 def test_rotate_secrets_script_smoke(tmp_path, monkeypatch):
-    """Smoke-test the rotation logic: encrypt a row under master A,
-    re-encrypt under master B, confirm only B can read it. We exercise
-    the same algorithm scripts/rotate-secrets.sh uses without forking
-    a subprocess (so a test failure is local to this function)."""
+    """Re-encryption invalidates the old master and preserves plaintext."""
     from cryptography.fernet import Fernet
 
     from surgite.secrets import _derive_fernet_key
@@ -750,16 +697,13 @@ def test_rotate_secrets_script_smoke(tmp_path, monkeypatch):
     master_a = "test-master-A"
     master_b = "test-master-B"
 
-    # Encrypt under master A.
     fernet_a = Fernet(_derive_fernet_key(master_a))
     fernet_b = Fernet(_derive_fernet_key(master_b))
     ciphertext = fernet_a.encrypt(b"gsk-original").decode("ascii")
 
-    # The rotation script's core: re-encrypt with the new master.
     plaintext = fernet_a.decrypt(ciphertext.encode("ascii"))
     new_ciphertext = fernet_b.encrypt(plaintext).decode("ascii")
 
-    # Old master can no longer read; new master can.
     try:
         fernet_a.decrypt(new_ciphertext.encode("ascii"))
         old_still_works = True
@@ -774,13 +718,7 @@ def test_rotate_secrets_script_smoke(tmp_path, monkeypatch):
 
 
 def _import_secrets_with_env(tmp_path, **env_overrides) -> subprocess.CompletedProcess:
-    """Import surgite.secrets in a fresh interpreter with a patched environment.
-
-    A subprocess rather than importlib.reload: reload mutates the live module's
-    __dict__ in place, so the module-level _fernet other tests already hold a
-    reference to would be swapped underneath them, and rows encrypted earlier in
-    the session would stop decrypting.
-    """
+    """Import secrets in an isolated process with environment overrides."""
     env = {k: v for k, v in os.environ.items() if k != "SECRETS_ENCRYPTION_KEY"}
     env.update(env_overrides)
     return subprocess.run(
@@ -794,18 +732,12 @@ def _import_secrets_with_env(tmp_path, **env_overrides) -> subprocess.CompletedP
 
 
 def test_secrets_key_file_env_var_relocates_the_generated_key(tmp_path):
-    """SECRETS_KEY_FILE moves the fallback key off the project root.
-
-    Without this, a container writes the key into /app — an image layer — and
-    every provider_keys row encrypted under it is unrecoverable after a
-    redeploy. The compose file relies on this to put the key on a volume.
-    """
+    """SECRETS_KEY_FILE relocates the generated fallback key."""
     key_path = tmp_path / "data" / ".secrets_key"
 
     result = _import_secrets_with_env(tmp_path, SECRETS_KEY_FILE=str(key_path))
 
     assert result.stdout.strip() == str(key_path)
-    # The parent directory did not exist: importing must create it, not crash.
     assert key_path.is_file()
     assert oct(key_path.stat().st_mode)[-3:] == "600"
 
@@ -826,11 +758,7 @@ def test_secrets_key_file_unset_still_defaults_to_the_project_root(tmp_path):
 
 
 def test_generated_key_is_reused_across_processes_at_the_same_path(tmp_path):
-    """Two starts pointed at the same durable path share one key.
-
-    This is the property the ephemeral-container bug violated: two starts
-    generated two different keys, silently orphaning every encrypted row.
-    """
+    """Processes using the same durable path reuse its key."""
     key_path = tmp_path / "data" / ".secrets_key"
 
     _import_secrets_with_env(tmp_path, SECRETS_KEY_FILE=str(key_path))
@@ -839,7 +767,3 @@ def test_generated_key_is_reused_across_processes_at_the_same_path(tmp_path):
     second = key_path.read_text()
 
     assert first == second
-
-
-# --- Item 13 lockdown: every documented authed route 401s in multi_user -----
-# (already covered at the top of the file)

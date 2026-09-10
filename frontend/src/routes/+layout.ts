@@ -1,11 +1,7 @@
-// SPA mode: FastAPI is the backend, so there's no SvelteKit server.
-// ssr=false renders everything client-side; prerender=true emits the static shell at build.
+// FastAPI serves a prerendered client-side shell.
 export const ssr = false;
 export const prerender = true;
 
-// ponytail: client-side auth gate. The backend is the real boundary; this is
-// a UX nicety so unauthenticated users land on /login instead of a 401/empty
-// page. Runs on every navigation via the layout load.
 import { redirect } from '@sveltejs/kit';
 import { fetchCurrentUser } from '$lib/api';
 import type { CurrentUser } from '$lib/api';
@@ -26,9 +22,7 @@ export async function load({
 		const user = await fetchCurrentUser();
 		return { user };
 	} catch (e) {
-		// ponytail: only 401 is a redirect signal. 5xx / network blips should
-		// render the page and let the user see a real error, not bounce them
-		// to /login for a transient outage.
+		// Do not turn transient API failures into login redirects.
 		if ((e as { status?: number }).status === 401) {
 			throw redirect(302, '/login?retry=1');
 		}

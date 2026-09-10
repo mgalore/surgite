@@ -1,10 +1,4 @@
 <script lang="ts">
-	// Per-user provider keys. A thin renderer over ProviderKeysStore — the
-	// decisions live there so they're testable without a DOM.
-	//
-	// The raw key exists in exactly two places: the password input below, and
-	// the request body in setProviderKey. It is never rendered back, logged, or
-	// stored — the API never returns it, and nothing here would have it to show.
 	import { ProviderKeysStore } from '$lib/provider-keys.svelte';
 	import { relativeTime } from '$lib/time';
 	import { toasts } from '$lib/toast.svelte';
@@ -16,8 +10,6 @@
 
 	let loaded = $state(false);
 	let editing = $state<string | null>(null);
-	// Keyed by provider, component-local: drafts never reach the store, and
-	// never reach localStorage/sessionStorage.
 	let drafts = $state<Record<string, string>>({});
 
 	$effect(() => {
@@ -44,7 +36,6 @@
 			return;
 		}
 		if (await store.save(provider, key)) {
-			// Only on success: a failed save keeps the draft so the user can retry.
 			cancel(provider);
 			toasts.success(`${provider} key saved`);
 		}
@@ -63,9 +54,6 @@
 		'border border-border px-2 py-1 text-xs text-fg-muted transition hover:text-fg disabled:opacity-50';
 </script>
 
-<!-- supported === null: not probed yet. Render nothing rather than a skeleton —
-     in off/single_user mode the section never appears at all, and a skeleton
-     that vanishes is a flash of content that shouldn't have been there. -->
 {#if store.supported}
 	<section>
 		<h2 class="text-sm text-fg-muted"><span class="text-accent">~/keys</span> <span aria-hidden="true">❯</span></h2>
@@ -153,4 +141,3 @@
 		{/if}
 	</section>
 {/if}
-

@@ -1,17 +1,13 @@
-// Reactive colorscheme, persisted to localStorage and reflected as `data-theme`
-// on <html>. The pre-paint script in app.html applies the saved scheme flash-free;
-// this store reads the same source so the UI starts in agreement.
+// Synced with the pre-paint theme script in app.html.
 import { browser } from '$app/environment';
 
 export interface ThemeDef {
 	id: string;
 	label: string;
-	// Swatch colors for the picker preview (kept in sync with layout.css).
 	bg: string;
 	accent: string;
 }
 
-// Order shown in the picker. GitHub Dark is the default.
 export const THEMES: ThemeDef[] = [
 	{ id: 'github-dark', label: 'GitHub Dark', bg: '#0d1117', accent: '#2f81f7' },
 	{ id: 'light', label: 'Light', bg: '#ffffff', accent: '#0969da' },
@@ -48,6 +44,4 @@ class ThemeState {
 
 export const theme = new ThemeState();
 
-// Normalize the DOM attribute after hydration — if localStorage held an invalid
-// value, the pre-paint script applied it as-is; this corrects it to the default.
 if (browser) theme.set(theme.current);

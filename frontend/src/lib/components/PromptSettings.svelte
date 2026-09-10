@@ -24,11 +24,7 @@
 	let loading = $state(false);
 	let loaded = $state(false);
 
-	// null = the global default; a number = a specific repo's override.
 	let selectedRepoId = $state<number | null>(null);
-	// repo_id of the row actually returned: when a repo has no override of its
-	// own, the API returns the global row (repo_id null), so the values shown
-	// are inherited rather than repo-specific.
 	let loadedRepoId = $state<number | null>(null);
 
 	let user_name = $state('');

@@ -5,6 +5,7 @@
 	import AddRepoForm from '$lib/components/AddRepoForm.svelte';
 	import HelpOverlay from '$lib/components/HelpOverlay.svelte';
 	import PromptSettings from '$lib/components/PromptSettings.svelte';
+	import ProviderKeys from '$lib/components/ProviderKeys.svelte';
 	import RepoList from '$lib/components/RepoList.svelte';
 	import SummaryPanel from '$lib/components/SummaryPanel.svelte';
 	import ThemePicker from '$lib/components/ThemePicker.svelte';
@@ -149,7 +150,13 @@
 			</div>
 		</div>
 		<div id="settings-panel" role="tabpanel" aria-labelledby="settings-tab" hidden={workspace !== 'settings'} class="px-4 pb-6 sm:px-6">
-			<div class="max-w-2xl"><PromptSettings {repos} active={workspace === 'settings'} requestedRepoId={requestedSettingsRepoId} requestVersion={settingsRequestVersion} /></div>
+			<div class="max-w-2xl">
+				<PromptSettings {repos} active={workspace === 'settings'} requestedRepoId={requestedSettingsRepoId} requestVersion={settingsRequestVersion} />
+				<!-- A separate component, not a section of PromptSettings: the two
+				     share no state, so a failed key write can't disturb the prompt
+				     form (and vice versa). Renders nothing outside multi_user. -->
+				<div class="mt-8"><ProviderKeys active={workspace === 'settings'} /></div>
+			</div>
 		</div>
 	</div>
 </main>

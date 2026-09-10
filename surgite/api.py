@@ -81,6 +81,7 @@ from surgite.schemas import (
     PasswordResetConfirm,
     PasswordResetRequest,
     PromptSettingsUpdate,
+    ProviderKeysResponse,
     ProviderKeysUpdate,
     RedeemInviteRequest,
     RepoCreate,
@@ -1387,20 +1388,35 @@ def _provider_key_to_dict(row: ProviderKeyRow) -> dict:
     summary="List configured provider keys",
     tags=["settings"],
     operation_id="get_provider_keys",
+    response_model=ProviderKeysResponse,
 )
 def get_provider_keys(
     session: Session = Depends(get_db),
     current_user: UserRow = Depends(get_current_user),
 ):
-    """Which providers the caller has configured. The raw key material is
-    never returned — only the provider name and timestamps."""
+    """Which providers the caller has configured, plus the catalogue of
+    provider names a client needs to render a key form. The raw key material
+    is never returned — only the provider name and timestamps.
+
+    The catalogue is names only. Whether a provider has a key configured is an
+    information-disclosure surface (docs/security.md), which is why /providers
+    is admin-only in multi_user; this route is open to every authenticated user,
+    so it must not carry that. Revoked rows are returned as-is: `revoked_at`
+    non-null means *not* configured, and it's what a client shows after a
+    revoke."""
     _require_multi_user()
     rows = session.scalars(
         select(ProviderKeyRow)
         .where(ProviderKeyRow.user_id == current_user.id)
         .order_by(ProviderKeyRow.provider)
     ).all()
-    return {"keys": [_provider_key_to_dict(r) for r in rows]}
+    return {
+        # Module attribute, not a from-import: LLM_LOCAL_ONLY is read once at
+        # import time, so tests monkeypatch summarizer.PROVIDERS itself.
+        "providers": list(summarizer.PROVIDERS),
+        "default": summarizer.default_provider(),
+        "keys": [_provider_key_to_dict(r) for r in rows],
+    }
 
 
 @app.put(

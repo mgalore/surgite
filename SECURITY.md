@@ -1,35 +1,21 @@
-# Security Policy
+# Security policy
 
-## Reporting a vulnerability
+For deployment controls and trust boundaries, see the [security model](docs/security.md).
 
-Please do not open a public issue for security vulnerabilities.
+## Report a vulnerability
 
-Report them privately by email to **nhcoleman@proton.me**. Include enough detail
-to reproduce — affected component, steps, and impact. You can expect an
-acknowledgement within a few days. Once a fix is available, the issue can be
-disclosed publicly with credit if you'd like it.
+Email [nhcoleman@proton.me](mailto:nhcoleman@proton.me) with a description, affected versions, reproduction steps, and impact. Do not open a public issue for a suspected vulnerability.
+
+We aim to acknowledge reports within two business days, complete initial triage within five, and issue a fix in the next supported release. High-severity issues may receive an out-of-cycle release. We publish material fixes in the changelog or an advisory and credit reporters when they agree.
 
 ## Supported versions
 
-This project is pre-1.0. Security fixes land on `main`; please test against the
-latest `main` before reporting.
+Security fixes target the latest minor release and the preceding minor release for six months after the newer minor release. The current window is:
 
-## Trust model
+| Version | Support |
+| --- | --- |
+| 1.5.x | Supported |
+| 1.4.x | Supported through 2027-03-08 |
+| 1.3.x and earlier | End of life |
 
-surgite is designed to run as a **personal, self-hosted tool on a trusted
-network** — not as a public, multi-tenant service. Operators should understand:
-
-- **No authentication.** The API and web UI have no built-in auth. Do not expose
-  them directly to the public internet; put them behind your own network, VPN, or
-  an authenticating reverse proxy.
-- **It runs `git` against paths and URLs you give it.** `POST /ingest` runs
-  `git log` on a local `repo_path`, and registered repos are cloned from their
-  `clone_url` into `REPO_CACHE_DIR` via `git clone`/`fetch`. Treat repo paths and
-  URLs as trusted input — only register repositories you control or trust.
-- **Provider API keys live in the environment** (`ANTHROPIC_API_KEY`, etc.). Keep
-  your `.env` out of version control (it is git-ignored) and protect the host.
-
-Reports that amount to "the unauthenticated API can be abused when exposed to the
-internet" are expected behavior given the trust model above, not vulnerabilities.
-Reports of a way to escape that model — e.g. injection beyond the documented
-`git` surface, reading arbitrary files, or leaking keys — are very much in scope.
+Upgrade guidance is in [docs/self-host.md](docs/self-host.md) and [the migration guides](docs/migrations/).

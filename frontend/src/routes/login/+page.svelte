@@ -26,8 +26,6 @@
 			await login(email.trim(), password);
 			goto('/');
 		} catch (e2) {
-			// The server returns 423 with a Retry-After header on lockout.
-			// `lockoutSeconds` is attached to the thrown Error by request().
 			const err = e2 as Error & { lockoutSeconds?: number };
 			error =
 				err.lockoutSeconds != null

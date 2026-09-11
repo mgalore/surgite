@@ -1,10 +1,4 @@
-"""Tests for the background ingest scheduler and the slimmed-down
-_ingest_all_repos that feeds it.
-
-The 0.4.0 plan removed the per-request _INGEST_CACHE / repo-filter dance:
-freshness is now owned by the FastAPI lifespan scheduler, and /summary is
-a pure read against the DB. These tests pin that contract.
-"""
+"""Background repository-ingest tests."""
 
 import threading
 import time
@@ -20,8 +14,7 @@ from surgite.models import Commit
 
 @pytest.fixture
 def fake_git(monkeypatch):
-    """Stub the git layer for _ingest_repo: returns commits from rec.commits
-    and records every ensure_repo call."""
+    """Provide a recording Git stub."""
 
     class Recorder:
         commits: list[Commit] = []
@@ -69,10 +62,6 @@ def test_ingest_all_repos_ingests_every_registered_repo(add_repo, fake_git):
 
 
 def test_ingest_all_repos_visits_every_registered_repo(add_repo, fake_git):
-    """The fake git layer shares one commit list across repos; we just
-    assert that every registered repo was *visited* (ensured_repo called +
-    a result row returned). The per-repo count semantics are pinned in
-    the single-repo test above."""
     add_repo(name="a", clone_url="https://example.com/a.git")
     add_repo(name="b", clone_url="https://example.com/b.git")
     fake_git.commits = make_commits(3)
@@ -235,8 +224,6 @@ def test_deleted_repo_exits_before_git_or_commit_insert(add_repo, fake_git):
 
 
 def test_summary_does_not_call_ingest(client, monkeypatch):
-    """0.4.0: /summary is a pure read. The scheduler (separate task) owns
-    freshness; the per-repo BackgroundTask on POST /repos handles new repos."""
     called = []
 
     def record():
@@ -261,9 +248,6 @@ async def test_lifespan_clears_ingest_executor(monkeypatch):
 
 
 def test_scheduler_runs_periodically(client_with_scheduler, add_repo, fake_git):
-    """With INGEST_INTERVAL=1 and one registered repo, the scheduler should
-    call _ingest_all_repos at least twice within the startup and two-tick
-    window (the scheduler may start before the repo is registered)."""
     add_repo()
     fake_git.commits = make_commits(2)
     deadline = time.monotonic() + 4
@@ -277,14 +261,11 @@ def test_scheduler_runs_periodically(client_with_scheduler, add_repo, fake_git):
 def test_scheduler_logs_and_continues_after_ingest_failure(
     client_with_scheduler, add_repo, fake_git, caplog
 ):
-    """A repo that fails to ingest must not kill the scheduler; the loop
-    should keep firing on subsequent ticks."""
     import logging
 
     add_repo()
     fake_git.commits = make_commits(1)
 
-    # After the first successful call, start raising.
     real_get_raw_log = api.get_raw_log
 
     def boom(*a, **kw):
@@ -296,22 +277,16 @@ def test_scheduler_logs_and_continues_after_ingest_failure(
             return real_get_raw_log(*a, **kw)
         boom()
 
-    # The fake_git fixture stubs api.get_raw_log; we wrap it to make the
-    # second invocation raise.
     with caplog.at_level(logging.WARNING, logger="surgite.api"):
-        # Wait for >=3 ingest attempts; the middle ones should log a warning.
         deadline = time.monotonic() + 3.5
         while time.monotonic() < deadline:
             if fake_git.calls >= 3:
                 break
             time.sleep(0.1)
-    # We don't assert caplog contents directly (race-prone), only that the
-    # scheduler kept running despite failures.
     assert fake_git.calls >= 2
 
 
 def test_scheduler_disabled_when_interval_is_zero(monkeypatch, add_repo, fake_git):
-    """INGEST_INTERVAL=0 (conftest default) must not start the scheduler."""
     monkeypatch.setenv("INGEST_INTERVAL", "0")
     from fastapi.testclient import TestClient
 

@@ -1,9 +1,4 @@
-"""Tests for the CLI-side auth helpers (surgite/cli_auth.py).
-
-The network commands (cmd_login etc.) are thin httpx wrappers; the logic worth
-testing is the session jar, the API-key resolution, and the pre-1.0.0
-session migrations (keyring service name, old 0600 file path).
-"""
+"""CLI authentication and session-storage tests."""
 
 import os
 import stat
@@ -15,9 +10,7 @@ from surgite import cli_auth
 
 @pytest.fixture(autouse=True)
 def _isolated_config(tmp_path, monkeypatch):
-    """Point the session jar at a temp dir, clear auth env vars, and force the
-    0600-file backend so tests never touch the developer's real OS keyring.
-    The keyring path gets its own tests with a fake backend below."""
+    """Isolate session files and avoid the real OS keyring."""
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
     for var in ("SURGITE_API_KEY", "SURGITE_EMAIL", "SURGITE_PASSWORD"):
         monkeypatch.delenv(var, raising=False)
@@ -27,8 +20,7 @@ def _isolated_config(tmp_path, monkeypatch):
 
 
 class _FakeKeyring:
-    """In-memory stand-in for the OS keyring, so the keyring code path is
-    tested without a real backend (and without prompting the dev keychain)."""
+    """In-memory keyring backend."""
 
     def __init__(self):
         self.store: dict[tuple[str, str], str] = {}
@@ -47,7 +39,6 @@ class _FakeKeyring:
 
 @pytest.fixture
 def fake_keyring(monkeypatch):
-    """Activate the keyring path backed by an in-memory store."""
     kr = _FakeKeyring()
     monkeypatch.setattr(cli_auth.keyring, "set_password", kr.set_password)
     monkeypatch.setattr(cli_auth.keyring, "get_password", kr.get_password)
@@ -58,7 +49,6 @@ def fake_keyring(monkeypatch):
 
 
 def test_session_round_trips_through_keyring(fake_keyring):
-    """With a keyring backend, the session lives in the keyring, not a file."""
     cli_auth.save_session("http://api", "n", "v")
     assert not cli_auth.session_file().exists()
     assert cli_auth.load_session() == {
@@ -71,20 +61,17 @@ def test_session_round_trips_through_keyring(fake_keyring):
 
 
 def test_keyring_migration_from_0600_file(fake_keyring):
-    """An existing 0600 file is migrated into the keyring and then shredded."""
     cli_auth._write_session_file(
         '{"api_url": "http://api", "cookie_name": "n", "cookie_value": "old"}'
     )
     assert cli_auth.session_file().exists()
-    sess = cli_auth.load_session()  # triggers the migration
+    sess = cli_auth.load_session()
     assert sess["cookie_value"] == "old"
     assert not cli_auth.session_file().exists(), "file should be shredded after migration"
     assert fake_keyring.get_password(cli_auth._KEYRING_SERVICE, cli_auth._KEYRING_USER) is not None
 
 
 def test_keyring_migration_from_legacy_service_name(fake_keyring):
-    """A session saved under the pre-rename `standup-gen` keyring service is
-    moved to the new service on first read, and the old entry is deleted."""
     blob = '{"api_url": "http://api", "cookie_name": "n", "cookie_value": "v"}'
     fake_keyring.set_password(cli_auth._LEGACY_KEYRING_SERVICE, cli_auth._KEYRING_USER, blob)
     sess = cli_auth.load_session()
@@ -96,13 +83,11 @@ def test_keyring_migration_from_legacy_service_name(fake_keyring):
 
 
 def test_file_migration_from_legacy_config_dir(fake_keyring):
-    """A 0600 file left at the pre-rename ~/.config/standup path is migrated
-    into the keyring on first read, then shredded."""
     legacy = cli_auth._legacy_session_file()
     legacy.parent.mkdir(parents=True, exist_ok=True)
     legacy.write_text('{"api_url": "http://api", "cookie_name": "n", "cookie_value": "old"}')
     assert legacy.exists()
-    sess = cli_auth.load_session()  # triggers the migration
+    sess = cli_auth.load_session()
     assert sess["cookie_value"] == "old"
     assert not legacy.exists(), "old-path file should be shredded after migration"
     assert fake_keyring.get_password(cli_auth._KEYRING_SERVICE, cli_auth._KEYRING_USER) is not None
@@ -271,9 +256,6 @@ def test_cmd_redeem_invite_failure_returns_1(monkeypatch):
 
 
 def test_cmd_redeem_invite_succeeds_without_cookie(monkeypatch):
-    """If the server returns 201 but no Set-Cookie, we still exit 0 and just
-    skip persisting the session (the operator can re-login interactively)."""
-
     class FakeResp:
         status_code = 201
         headers: dict = {}

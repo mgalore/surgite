@@ -1,8 +1,4 @@
-"""Org data-model tests.
-
-Orgs are invisible from the API, so these exercise the primitives directly:
-the slug rule and `create_personal_org` (idempotency + slug disambiguation).
-"""
+"""Organization data-model tests."""
 
 from sqlalchemy import select
 

@@ -1,22 +1,4 @@
-"""Email delivery.
-
-A tiny mailer abstraction with two implementations:
-
-  - ``SMTPMailer``  — sends over SMTP via stdlib ``smtplib`` (STARTTLS,
-    implicit TLS, or plain). Configured from ``SMTP_*`` env vars.
-  - ``LoggingMailer`` — writes the rendered email to the structured log
-    instead of sending. The default when ``SMTP_HOST`` is unset, so a
-    self-hoster who hasn't configured mail still gets a working password
-    reset: the link lands in the log stream they already watch.
-
-Templates are plain-text files in ``surgite/templates/email/*.txt`` with
-``{placeholder}`` fields filled by ``str.format``. The first line is
-``Subject: ...``; everything after the blank line is the body.
-
-ponytail: no Jinja2 (not a dependency here) and no HTML email — one
-plain-text template with a few substitutions is ``str.format`` on a file.
-Reach for a template engine when there's a second template with logic.
-"""
+"""Plain-text email delivery over SMTP or application logs."""
 
 from __future__ import annotations
 
@@ -34,10 +16,7 @@ _TEMPLATE_DIR = Path(__file__).resolve().parent / "templates" / "email"
 
 
 def render_template(name: str, context: dict) -> tuple[str, str]:
-    """Load ``templates/email/<name>.txt``, fill ``{...}`` fields from
-    ``context``, and split it into (subject, body). Raises KeyError if the
-    template references a field the caller didn't supply — a loud failure
-    is better than mailing a half-rendered link."""
+    """Render a plain-text template into its subject and body."""
     raw = (_TEMPLATE_DIR / f"{name}.txt").read_text(encoding="utf-8")
     filled = raw.format(**context)
     first, _, body = filled.partition("\n")
@@ -54,8 +33,7 @@ class Mailer(Protocol):
 
 
 class LoggingMailer:
-    """Writes the email to the log instead of sending it. The default when
-    no SMTP host is configured; also what the tests use."""
+    """Log email when SMTP is not configured."""
 
     def send(self, to: str, subject: str, body: str) -> None:
         log.info(
@@ -72,8 +50,7 @@ class LoggingMailer:
 
 
 class SMTPMailer:
-    """Sends over SMTP via stdlib ``smtplib``. TLS mode is ``starttls``
-    (port 587), ``ssl`` (implicit TLS, port 465), or ``none``."""
+    """Send email over plain SMTP, STARTTLS, or implicit TLS."""
 
     def __init__(self) -> None:
         self.host = config.SMTP_HOST

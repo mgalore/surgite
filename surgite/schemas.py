@@ -4,11 +4,7 @@ from pydantic import BaseModel
 
 
 class ErrorResponse(BaseModel):
-    """The error envelope every route returns on failure. FastAPI's native
-    shape — ``HTTPException(detail=...)`` and the CSRF / SQLAlchemy handlers
-    in ``surgite.api`` all serialise to ``{"detail": "..."}``. Declared here
-    so the OpenAPI snapshot documents the stable error contract (0.6.0
-    api-stability policy)."""
+    """The shared API error envelope."""
 
     detail: str
 
@@ -29,8 +25,6 @@ class RepoResponse(BaseModel):
 
 class RepoListResponse(BaseModel):
     repos: list[RepoResponse]
-    # The client uses this scheduler-derived window to label old successful
-    # ingests without baking an operator-specific interval into the UI.
     stale_after_seconds: int | None
 
 
@@ -39,9 +33,7 @@ class IngestAccepted(BaseModel):
 
 
 class ShareCreate(BaseModel):
-    """Parameters of a summary to persist behind a shareable slug. Mirrors the
-    /summary query string; all fields optional so a bare 'all repos, last 7
-    days' share is valid."""
+    """Summary parameters saved behind a shareable slug."""
 
     repo: str | None = None
     since: str | None = None
@@ -76,9 +68,7 @@ class LoginRequest(BaseModel):
 
 
 class RedeemInviteRequest(BaseModel):
-    """Claim an invite and set the new account's password. `email` is required
-    only for an open invite (one with no email pinned); for a pinned invite the
-    server uses the invite's email and ignores this field."""
+    """Invite-redemption fields; open invites also require an email."""
 
     token: str
     password: str
@@ -87,19 +77,14 @@ class RedeemInviteRequest(BaseModel):
 
 
 class ApiKeyCreate(BaseModel):
-    """Mint a new per-user API key. The full key is returned in the response
-    exactly once."""
+    """API key creation fields."""
 
     name: str
     expires_at: datetime | None = None
 
 
 class InviteCreateRequest(BaseModel):
-    """Create a new invite token. `email` is optional — an open invite
-    (null email) can be redeemed by any new user; a pinned invite is
-    locked to one address. `role` is either ``"user"`` (default) or
-    ``"admin"``. The redeem token is returned in the response so the
-    admin can copy it out of band."""
+    """Invite creation fields."""
 
     email: str | None = None
     role: str = "user"
@@ -107,9 +92,7 @@ class InviteCreateRequest(BaseModel):
 
 
 class ProviderKeyStatus(BaseModel):
-    """One of the caller's provider_keys rows. Never carries key material —
-    only the provider name and the row's timestamps. A non-null ``revoked_at``
-    means the provider is *not* configured."""
+    """Provider key metadata without key material."""
 
     provider: str
     created_at: str | None = None
@@ -117,11 +100,7 @@ class ProviderKeyStatus(BaseModel):
 
 
 class ProviderKeysResponse(BaseModel):
-    """The caller's own key rows plus the provider catalogue the settings form
-    needs to render. ``providers`` is the server's visible registry
-    (LLM_LOCAL_ONLY filtered), deliberately without any key-presence data:
-    whether a provider *has* a key configured stays behind the admin-only
-    /providers boundary. See docs/security.md."""
+    """Visible providers and the caller's key metadata."""
 
     providers: list[str]
     default: str
@@ -129,9 +108,7 @@ class ProviderKeysResponse(BaseModel):
 
 
 class ProviderKeysUpdate(BaseModel):
-    """Set (or replace) a per-user provider key. The clear flag revokes the
-    existing row; the key field is required otherwise. The raw key is never
-    returned by the API."""
+    """Set, replace, or revoke a provider key."""
 
     provider: str
     key: str | None = None
@@ -139,26 +116,20 @@ class ProviderKeysUpdate(BaseModel):
 
 
 class PasswordChange(BaseModel):
-    """Self-service password change. The user proves control
-    of the current password; on success every other session is revoked
-    and the current session is kept."""
+    """Self-service password change fields."""
 
     current_password: str
     new_password: str
 
 
 class PasswordResetRequest(BaseModel):
-    """Start the self-serve password reset (0.6.0). The endpoint always
-    returns 204, even for an unknown email, so this never reveals whether
-    an account exists."""
+    """Password reset request fields."""
 
     email: str
 
 
 class PasswordResetConfirm(BaseModel):
-    """Redeem an admin-minted one-time reset token. 15-minute expiry,
-    one-time use; on success all of the user's sessions are revoked
-    and the lockout is cleared."""
+    """Password reset confirmation fields."""
 
     token: str
     new_password: str

@@ -3,16 +3,12 @@
 	import { onMount } from 'svelte';
 	import { fetchCurrentUser, logout, type CurrentUser } from '$lib/api';
 
-	// null = still loading or auth-disabled (off/single_user). We don't
-	// render anything in that case so the header stays clean in the
-	// common case where the deploy is single-user.
 	let user = $state<CurrentUser | null>(null);
 
 	onMount(async () => {
 		try {
 			user = await fetchCurrentUser();
 		} catch {
-			// 401 in multi_user without a session -> nothing to show.
 			user = null;
 		}
 	});
@@ -21,7 +17,6 @@
 		try {
 			await logout();
 		} catch {
-			// Cookie is already invalid; just bounce to the login page.
 		}
 		goto('/login');
 	}

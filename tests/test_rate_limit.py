@@ -1,4 +1,4 @@
-"""Tests for the active per-user and per-IP-outer summary rate limits."""
+"""Rate-limit tests."""
 
 import pytest
 from fastapi import HTTPException
@@ -8,17 +8,13 @@ from surgite import rate_limit
 
 @pytest.fixture(autouse=True)
 def _reset_buckets():
-    """Each test starts with a clean bucket; the global module state is
-    process-local, and the /summary ai tests would otherwise contaminate
-    this module's view of the world."""
     rate_limit._reset_for_tests()
     yield
     rate_limit._reset_for_tests()
 
 
 class _StubRequest:
-    """Minimal stand-in for a starlette Request, exercising the same code
-    path the real handler uses (headers + client.host)."""
+    """Minimal request with forwarding and peer addresses."""
 
     def __init__(self, ip="1.2.3.4", fwd=None):
         self.headers = {"x-forwarded-for": fwd} if fwd else {}
@@ -42,36 +38,25 @@ def test_blocks_request_over_limit():
 def test_separate_buckets_per_ip():
     for _ in range(rate_limit._SUMMARY_IP_REQUESTS):
         rate_limit.check_ip_outer_rate_limit(_StubRequest(ip="1.1.1.1"))
-    # Different IP must still get a fresh budget.
     rate_limit.check_ip_outer_rate_limit(_StubRequest(ip="2.2.2.2"))
 
 
 def test_honors_x_forwarded_for_when_trusted(monkeypatch):
-    """When the direct peer is trusted, X-Forwarded-For is used for bucketing."""
     monkeypatch.setattr(rate_limit, "TRUSTED_PROXIES", ["10.0.0.0/8", "127.0.0.1"])
     for _ in range(rate_limit._SUMMARY_IP_REQUESTS):
         rate_limit.check_ip_outer_rate_limit(_StubRequest(fwd="9.9.9.9", ip="10.0.0.1"))
-    # Direct peer can keep going; only the proxied IP is throttled.
     rate_limit.check_ip_outer_rate_limit(_StubRequest(ip="10.0.0.1"))
 
 
 def test_ignores_x_forwarded_for_when_untrusted():
-    """When TRUSTED_PROXIES is empty (default), X-Forwarded-For is ignored
-    and the direct peer address is used for bucketing."""
     for _ in range(rate_limit._SUMMARY_IP_REQUESTS):
         rate_limit.check_ip_outer_rate_limit(_StubRequest(fwd="9.9.9.9", ip="1.2.3.4"))
-    # If X-Forwarded-For were honoured, the 9.9.9.9 bucket would be full
-    # and the direct peer 1.2.3.4 would still have a fresh budget. But
-    # since we ignore the header, the 1.2.3.4 bucket is full.
     with pytest.raises(HTTPException) as exc:
         rate_limit.check_ip_outer_rate_limit(_StubRequest(fwd="8.8.8.8", ip="1.2.3.4"))
     assert exc.value.status_code == 429
 
 
 def test_window_expiry_resets_bucket(monkeypatch):
-    """After the window passes, the bucket is empty again. We push the
-    synthetic clock forward past the window length so the oldest entry
-    is no longer inside the window."""
     fake_now = [1000.0]
     monkeypatch.setattr(rate_limit.time, "monotonic", lambda: fake_now[0])
     for _ in range(rate_limit._SUMMARY_IP_REQUESTS):
@@ -84,14 +69,11 @@ def test_window_expiry_resets_bucket(monkeypatch):
 
 
 def test_summary_without_ai_is_not_rate_limited(client):
-    """Cheap read endpoints are unmetered — only ai=true costs money."""
     for _ in range(rate_limit._SUMMARY_USER_REQUESTS + 5):
         assert client.get("/summary").status_code == 200
 
 
 def test_summary_with_ai_returns_429_after_limit(client, monkeypatch):
-    # 400 fires first when the key is missing — that's a fine 4xx, but the
-    # rate-limit guard runs before it, so a 429 still proves the limit hit.
     for _ in range(rate_limit._SUMMARY_USER_REQUESTS):
         r = client.get("/summary?ai=true&provider=groq")
         assert r.status_code == 400  # GROQ_API_KEY empty in conftest

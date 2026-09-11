@@ -1,9 +1,4 @@
-"""Tests for the mailer abstraction (surgite/mail.py).
-
-The network send (SMTPMailer) is a thin smtplib wrapper; the logic worth
-testing is template rendering and that the default LoggingMailer actually
-emits the rendered email so password reset works with no SMTP configured.
-"""
+"""Email rendering and delivery-selection tests."""
 
 import logging
 
@@ -24,7 +19,7 @@ def test_render_template_splits_subject_and_fills_fields():
 
 def test_render_template_missing_field_raises():
     with pytest.raises(KeyError):
-        mail.render_template("password-reset", {"reset_url": "https://x"})  # no ttl_minutes
+        mail.render_template("password-reset", {"reset_url": "https://x"})
 
 
 def test_logging_mailer_writes_the_email(caplog):

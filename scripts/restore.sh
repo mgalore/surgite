@@ -1,16 +1,8 @@
 #!/usr/bin/env bash
-# Restore a surgite backup produced by backup.sh.
-#
-# The dump is a plain pg_dump piped through gzip — restoring is a
-# `gunzip | psql` away. Two modes mirror backup.sh: "docker" (the default,
-# targets the `db` service) and "local" (host-side psql against a URL).
-#
+# Restore a backup by replacing the target database.
 # Usage:
 #   scripts/restore.sh path/to/surgite-20260101T120000Z.sql.gz
 #   BACKUP_MODE=local BACKUP_PG_URL=... scripts/restore.sh ./backup.sql.gz
-#
-# This script DROPS and recreates the target database before loading.
-# It is destructive by design — restore means restore, not merge.
 
 set -euo pipefail
 
@@ -30,7 +22,6 @@ PG_DB="${POSTGRES_DB:-surgite}"
 echo "[restore] reading $DUMP (mode=$MODE)"
 
 run_restore() {
-    # stdin is the gunzipped dump; the inner command applies it.
     gunzip -c "$DUMP" | "$@"
 }
 
@@ -39,9 +30,6 @@ if [[ "$MODE" == "docker" ]]; then
         echo "[restore] docker not found; set BACKUP_MODE=local or install docker" >&2
         exit 1
     fi
-    # Drop+recreate inside the existing db container so the WAL/data dir
-    # stays where Postgres expects it. `psql -c` to drop the active
-    # connections, then CREATE DATABASE, then load the dump.
     DC="docker compose -p $PROJECT exec -T db"
     $DC psql -U "$PG_USER" -d postgres -v ON_ERROR_STOP=1 -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='$PG_DB' AND pid <> pg_backend_pid();" >/dev/null
     $DC dropdb -U "$PG_USER" --if-exists "$PG_DB"
@@ -52,9 +40,6 @@ elif [[ "$MODE" == "local" ]]; then
         echo "[restore] BACKUP_MODE=local requires BACKUP_PG_URL" >&2
         exit 1
     fi
-    # psql URL form doesn't carry a "database to administer"; we need
-    # the admin URL explicitly. Reuse BACKUP_PG_URL_ADMIN if set,
-    # otherwise derive postgres://... from BACKUP_PG_URL.
     ADMIN_URL="${BACKUP_PG_URL_ADMIN:-${BACKUP_PG_URL%/surgite}/postgres}"
     psql "$ADMIN_URL" -v ON_ERROR_STOP=1 -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='$PG_DB' AND pid <> pg_backend_pid();" >/dev/null
     dropdb "${BACKUP_PG_URL%/*}/$PG_DB" 2>/dev/null || true

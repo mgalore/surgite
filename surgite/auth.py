@@ -1,23 +1,4 @@
-"""Auth primitives for 0.5.0: password hashing, server-side sessions, and the
-`get_current_user` FastAPI dependency.
-
-The dependency is the single gate the rest of the API leans on — route handlers
-take `current_user: UserRow = Depends(get_current_user)` and scope their queries
-to `current_user.id` rather than sprinkling auth checks through every handler.
-
-Three modes, selected by `AUTH_MODE` (read fresh from `surgite.config` on every
-call so tests can flip it):
-
-  off         — anonymous; resolves to the bootstrap user. 0.4.0 behaviour.
-  single_user — resolves to the bootstrap user; the machinery is exercised but
-                no login flow is exposed.
-  multi_user  — full session-cookie or Bearer API-key auth; an absent/expired/
-                invalid session or key is a 401.
-
-Designed so OIDC can be added in 0.6.0 by replacing only the multi_user branch
-of `get_current_user` with one that consults an OIDC verifier first, falling
-back to the cookie.
-"""
+"""Passwords, sessions, API keys, and FastAPI auth dependencies."""
 
 import ipaddress
 import logging
@@ -46,12 +27,7 @@ from surgite.db import (
 
 log = logging.getLogger(__name__)
 
-# argon2id with the library defaults, which are already a safe, modern
-# configuration. Tuning the parameters to ~250 ms on the target hardware
-# would be better still, but needs a real box to measure against.
 _ph = PasswordHasher()
-
-# A 256-bit opaque session id, url-safe so it's a valid cookie value as-is.
 _SESSION_ID_BYTES = 32
 
 
@@ -63,8 +39,7 @@ def hash_password(plain: str) -> str:
 
 
 def verify_password(plain: str, hashed: str) -> bool:
-    """True iff `plain` matches `hashed`. Never raises on a bad password or a
-    malformed hash — both are just a failed verification."""
+    """Return whether a password matches, including for malformed hashes."""
     try:
         return _ph.verify(hashed, plain)
     except VerifyMismatchError, InvalidHashError:
@@ -78,24 +53,14 @@ def normalize_email(email: str) -> str:
 # --- API keys (Bearer) ------------------------------------------------------
 
 
-# A full key is `sk_<prefix>_<secret>` where prefix is 8 chars and secret is
-# 32 chars. The DB stores an argon2id hash of the *full* key plus the prefix
-# for a fast lookup index (argon2 is intentionally slow — we don't want to
-# hash every incoming Bearer just to identify the key).
 _API_KEY_SECRET_LEN = 32
 _API_KEY_PREFIX_BYTES = 4  # 4 bytes -> 8 hex chars after "sk_"
 _API_KEY_SECRET_BYTES = 24  # 24 bytes -> 32 chars urlsafe
 
 
 def _generate_api_key() -> tuple[str, str, str]:
-    """Mint a new (full_key, prefix, secret) triple. The full key is what the
-    caller stores; only the prefix and the argon2id hash of the full key hit
-    the DB. The secret portion is the second half of the key, returned as
-    part of `full_key` so the CLI can present it to the user once."""
-    # Hex, not token_urlsafe: urlsafe's alphabet includes "_", and a "_" in
-    # the prefix breaks verify_api_key's split("_", 2) reassembly (the 1.0.0
-    # bug where ~8% of issued keys 401'd on first use). The secret may
-    # contain "_" freely — maxsplit=2 keeps it intact.
+    """Return a full API key, its lookup prefix, and its secret."""
+    # Hex keeps the prefix free of the key format's underscore separator.
     prefix = "sk_" + secrets.token_hex(_API_KEY_PREFIX_BYTES)
     secret = secrets.token_urlsafe(_API_KEY_SECRET_BYTES)[:_API_KEY_SECRET_LEN]
     full = f"{prefix}_{secret}"
@@ -108,9 +73,7 @@ def issue_api_key(
     name: str,
     expires_at: datetime | None = None,
 ) -> tuple[str, str]:
-    """Create a new API key for `user_id`. Returns ``(full_key, key_id)``.
-    ``full_key`` is shown to the caller exactly once (they need to put it
-    in their CI secret); only the argon2id hash is persisted."""
+    """Create an API key and return its one-time plaintext value and ID."""
     full, prefix, _secret = _generate_api_key()
     kid = secrets.token_urlsafe(8)
     now = datetime.now(UTC)
@@ -131,9 +94,7 @@ def issue_api_key(
 
 
 def verify_api_key(full_key: str, *, session: Session) -> UserRow | None:
-    """Resolve a Bearer key to its user. Returns None on any failure (no
-    key, unknown prefix, bad hash, expired, revoked). Updates
-    ``last_used_at`` on success."""
+    """Resolve an active Bearer key and update its last-used time."""
     if not full_key or not full_key.startswith("sk_"):
         return None
     parts = full_key.split("_", 2)
@@ -154,9 +115,7 @@ def verify_api_key(full_key: str, *, session: Session) -> UserRow | None:
 
 
 def revoke_api_key(key_id: str, *, user_id: str | None = None) -> bool:
-    """Revoke a key by id. If ``user_id`` is given, only revoke keys owned
-    by that user (the per-user DELETE path). Returns True iff a row was
-    updated."""
+    """Revoke a key, optionally restricting it to one owner."""
     with session_scope() as s:
         q = select(ApiKeyRow).where(ApiKeyRow.id == key_id)
         if user_id is not None:
@@ -173,45 +132,32 @@ def revoke_api_key(key_id: str, *, user_id: str | None = None) -> bool:
 
 
 def is_locked(user: UserRow) -> bool:
-    """True iff `user.locked_until` is set and in the future. The check is
-    pure read; the caller is responsible for deciding how to surface it
-    (the auth_login handler turns it into a 423 with a Retry-After)."""
+    """Return whether the user's login lockout is active."""
     if user.locked_until is None:
         return False
     return _as_utc(user.locked_until) > datetime.now(UTC)
 
 
 def record_login_failure(user: UserRow, *, session: Session) -> None:
-    """Bump the per-user failure counter. Trips a lockout window if the
-    count crosses ``LOGIN_LOCKOUT_THRESHOLD`` within
-    ``LOGIN_LOCKOUT_WINDOW_MINUTES`` of the first failure. The window is
-    observed by clearing the counter when the gap to the *last* failure
-    exceeds the window — the implementation here is "increment and
-    re-evaluate", which over-locks slightly in the corner case of a
-    slow-but-steady attacker. The over-lock is bounded by the window
-    length and is preferable to under-locking."""
+    """Record a failure and lock the user after the configured threshold."""
     user.failed_login_count += 1
     if user.failed_login_count >= config.LOGIN_LOCKOUT_THRESHOLD:
         user.locked_until = datetime.now(UTC) + timedelta(
             minutes=config.LOGIN_LOCKOUT_DURATION_MINUTES
         )
-        user.failed_login_count = 0  # reset so a fresh attempt after unlock starts at 0
+        user.failed_login_count = 0
     session.commit()
 
 
 def record_login_success(user: UserRow, *, session: Session) -> None:
-    """Reset the failure counter and clear the lockout on a successful
-    login. Belt-and-braces: the lockout check rejects locked users
-    regardless, but resetting the count on success means a user who
-    eventually types their password right isn't still sitting on 9
-    failed attempts."""
+    """Clear failed-login state after a successful login."""
     user.failed_login_count = 0
     user.locked_until = None
     session.commit()
 
 
 def unlock_user(user: UserRow, *, session: Session) -> None:
-    """Admin action: clear the lockout and the failure counter."""
+    """Clear the user's lockout and failure counter."""
     user.failed_login_count = 0
     user.locked_until = None
     session.commit()
@@ -221,9 +167,7 @@ def unlock_user(user: UserRow, *, session: Session) -> None:
 
 
 def slugify_org(local_part: str) -> str:
-    """Turn an email local-part into a URL-safe org slug base (lowercase,
-    [a-z0-9-], 3–32 chars). Pure, no DB — the 1.0.0 org backfill migration
-    re-implements the same rule inline (kept trivial so it can't drift far)."""
+    """Convert an email local part to a 3–32 character org slug."""
     s = re.sub(r"[^a-z0-9]+", "-", local_part.lower()).strip("-")[:32].strip("-")
     if len(s) < 3:
         s = f"{s}-org" if s else "org"
@@ -231,10 +175,7 @@ def slugify_org(local_part: str) -> str:
 
 
 def create_personal_org(session: Session, user: UserRow) -> OrgRow:
-    """Create the user's personal org + owner membership and point
-    ``user.personal_org_id`` at it. Idempotent: returns the existing personal
-    org if one is already set. Called from both user-creation paths so the
-    slug/role invariants match the 1.0.0 migration backfill."""
+    """Return the user's personal org, creating it when needed."""
     if user.personal_org_id is not None:
         existing = session.get(OrgRow, user.personal_org_id)
         if existing is not None:
@@ -246,7 +187,7 @@ def create_personal_org(session: Session, user: UserRow) -> OrgRow:
         slug = f"{base}-{n}"
     org = OrgRow(name=user.display_name or base, slug=slug)
     session.add(org)
-    session.flush()  # assign org.id before the membership/back-reference
+    session.flush()
     session.add(OrgMemberRow(org_id=org.id, user_id=user.id, role="owner"))
     user.personal_org_id = org.id
     session.commit()
@@ -255,15 +196,12 @@ def create_personal_org(session: Session, user: UserRow) -> OrgRow:
 
 
 def personal_org_id(session: Session, user_id: str) -> str | None:
-    """The user's personal org id, for insert sites that only carry a user_id.
-    None only for pre-migration data with no personal org."""
+    """Look up a user's personal org ID."""
     return session.scalar(select(UserRow.personal_org_id).where(UserRow.id == user_id))
 
 
 def ensure_bootstrap_user(session: Session) -> UserRow:
-    """Return the BOOTSTRAP_OWNER_EMAIL user, creating it (as an admin with no
-    password) if it doesn't exist. This is the account that owns all data in
-    off/single_user mode and the backfill target for the 0.4.0 migration."""
+    """Return or create the owner used by off and single-user modes."""
     email = normalize_email(config.BOOTSTRAP_OWNER_EMAIL)
     user = session.scalar(select(UserRow).where(UserRow.email == email))
     if user is None:
@@ -271,7 +209,7 @@ def ensure_bootstrap_user(session: Session) -> UserRow:
         session.add(user)
         session.commit()
         session.refresh(user)
-    create_personal_org(session, user)  # idempotent; ensures a personal org exists
+    create_personal_org(session, user)
     return user
 
 
@@ -293,7 +231,7 @@ def create_user(
     session.add(user)
     session.commit()
     session.refresh(user)
-    create_personal_org(session, user)  # every account gets a personal org (1.0.0)
+    create_personal_org(session, user)
     return user
 
 
@@ -310,8 +248,6 @@ def create_invite(
         email=normalize_email(email) if email else None,
         role=role,
         created_by=created_by,
-        # Issuing org: the creator's personal org. None for the bootstrap
-        # invite, which has no creator yet.
         org_id=personal_org_id(session, created_by) if created_by else None,
         created_at=datetime.now(UTC),
         expires_at=datetime.now(UTC) + timedelta(days=ttl_days),
@@ -323,10 +259,7 @@ def create_invite(
 
 
 def ensure_bootstrap_invite(session: Session) -> str | None:
-    """In multi_user mode with no active admin yet, mint a single admin invite
-    for BOOTSTRAP_OWNER_EMAIL so the operator has a way in on first run. Returns
-    the redeem token (new or the still-unused existing one), or None if an
-    active admin already exists. Idempotent across restarts."""
+    """Return the reusable first-admin invite when bootstrap is needed."""
     if config.AUTH_MODE != "multi_user":
         return None
     admin = session.scalar(
@@ -348,14 +281,12 @@ def ensure_bootstrap_invite(session: Session) -> str | None:
 
 
 def _as_utc(dt: datetime) -> datetime:
-    """Treat a tz-naive datetime as UTC. Postgres returns aware datetimes for
-    our timezone=True columns; SQLite (the test DB) hands back naive ones."""
+    """Treat SQLite's naive datetimes as UTC."""
     return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
 
 
 def _truncate_ip(ip: str | None) -> str | None:
-    """Reduce an address to its /24 (v4) or /64 (v6) network so we keep a
-    coarse origin for audit without storing a full client address."""
+    """Coarsen an IP address before storing it for audit."""
     if not ip:
         return None
     try:
@@ -401,9 +332,7 @@ def revoke_session(session_id: str, *, session: Session | None = None) -> None:
 
 
 def purge_expired_sessions() -> int:
-    """Delete sessions past their expiry. Called by the lifespan scheduler.
-    The read path (get_current_user) rejects expired sessions independently,
-    so this is housekeeping to keep the table small. Returns rows deleted."""
+    """Delete expired sessions and return the number removed."""
     now = datetime.now(UTC)
     with session_scope() as s:
         rows = s.scalars(select(SessionRow).where(SessionRow.expires_at <= now)).all()
@@ -414,9 +343,7 @@ def purge_expired_sessions() -> int:
 
 
 def revoke_all_sessions(user_id: str, *, keep: str | None = None) -> int:
-    """Revoke every session for ``user_id``. Optionally keep the session
-    with id ``keep`` (used by PUT /auth/password so the user isn't logged
-    out mid-change). Returns the number of rows deleted."""
+    """Revoke a user's sessions, optionally preserving one."""
     with session_scope() as s:
         q = select(SessionRow).where(SessionRow.user_id == user_id)
         if keep is not None:
@@ -432,12 +359,7 @@ def revoke_all_sessions(user_id: str, *, keep: str | None = None) -> int:
 
 
 def change_password(user_id: str, *, new_password: str) -> None:
-    """Hash ``new_password`` and store it on user ``user_id``. The
-    caller is responsible for revoking the user's other sessions
-    (see ``revoke_all_sessions``) — keeping that step at the call
-    site documents *which* sessions are kept (the calling one)
-    right next to the policy decision. We re-fetch the user inside
-    our own scope so the caller's request session is untouched."""
+    """Replace a user's password hash."""
     with session_scope() as s:
         user = s.get(UserRow, user_id)
         if user is None:
@@ -447,10 +369,6 @@ def change_password(user_id: str, *, new_password: str) -> None:
 
 
 # --- Password reset tokens --------------------------------------------------
-# 15-minute expiry; one-time use. The full token is ``pr_<id>_<secret>``;
-# we keep only the argon2id hash and the 8-char ``id`` for the lookup
-# index, same as the api_keys design.
-
 _PASSWORD_RESET_TTL_MINUTES = 15
 _PASSWORD_RESET_ID_BYTES = 4  # token_hex(4) -> 8 hex chars, separator-free
 _PASSWORD_RESET_ID_LEN = _PASSWORD_RESET_ID_BYTES * 2
@@ -458,23 +376,14 @@ _PASSWORD_RESET_SECRET_BYTES = 32
 
 
 def _generate_reset_token() -> tuple[str, str]:
-    """Mint a new (full_token, id) pair. The full token is what gets emailed
-    to the user once; the id is the lookup index.
-
-    The id is hex (``token_hex``), not ``token_urlsafe``: the token format is
-    ``pr_<id>_<secret>`` and the id must not contain the ``_``/``-`` that
-    ``token_urlsafe`` can emit, or redemption can't reliably split the id
-    back out. The secret keeps full url-safe entropy."""
+    """Return a reset token and its separator-free lookup ID."""
     rid = secrets.token_hex(_PASSWORD_RESET_ID_BYTES)
     secret = secrets.token_urlsafe(_PASSWORD_RESET_SECRET_BYTES)
     return f"pr_{rid}_{secret}", rid
 
 
 def mint_password_reset(user_id: str) -> tuple[str, datetime]:
-    """Create a new reset token for ``user_id``. Returns the (full_token,
-    expires_at) pair; the admin delivers the token to the user. The
-    full token is argon2id-hashed before persistence; only the id
-    prefix and the hash hit the DB."""
+    """Persist a reset token and return its one-time plaintext value."""
     full, rid = _generate_reset_token()
     now = datetime.now(UTC)
     expires_at = now + timedelta(minutes=_PASSWORD_RESET_TTL_MINUTES)
@@ -494,17 +403,7 @@ def mint_password_reset(user_id: str) -> tuple[str, datetime]:
 
 
 def redeem_password_reset(token: str, *, new_password: str) -> str | None:
-    """Validate ``token``, set ``new_password`` on the user, revoke all
-    of the user's sessions, and clear the lockout. Returns the user id
-    on success, None if the token is unknown / expired / used / the
-    user is inactive.
-
-    The token format is ``pr_<id>_<secret>`` where ``<id>`` is exactly
-    ``_PASSWORD_RESET_ID_LEN`` chars. We slice the id out by position
-    rather than splitting on ``_``: ``token_urlsafe`` can emit ``_`` and
-    ``-``, so a split would mis-parse the (~few %) of ids that contain an
-    underscore. The full token is still verified against the argon2id hash,
-    so a wrong slice fails safe."""
+    """Redeem a reset token, returning the user ID on success."""
     if not token or not token.startswith("pr_"):
         return None
     rid = token[3 : 3 + _PASSWORD_RESET_ID_LEN]
@@ -521,16 +420,11 @@ def redeem_password_reset(token: str, *, new_password: str) -> str | None:
         if user is None or not user.is_active:
             return None
         user.password_hash = hash_password(new_password)
-        # Defence in depth: a successful reset clears the lockout so the
-        # user isn't sitting on a counter that locks them out moments
-        # after they get back in.
         user.failed_login_count = 0
         user.locked_until = None
         row.used_at = now
         s.commit()
         user_id = user.id
-    # Revoke the user's sessions out-of-band so a concurrent login
-    # can't sneak in between the password change and the next read.
     revoke_all_sessions(user_id)
     return user_id
 
@@ -539,9 +433,7 @@ def redeem_password_reset(token: str, *, new_password: str) -> str | None:
 
 
 def set_session_cookie(response: Response, session_id: str) -> None:
-    """Set the hardened session cookie. `__Host-` prefix + Secure in
-    production (see config.SESSION_COOKIE_NAME); plain + insecure only in
-    DEBUG so local plain-HTTP dev works."""
+    """Set the session cookie, allowing insecure cookies only in debug mode."""
     response.set_cookie(
         key=config.SESSION_COOKIE_NAME,
         value=session_id,
@@ -565,27 +457,11 @@ def get_current_user(
     response: Response,
     session: Session = Depends(get_db),
 ) -> UserRow:
-    """Resolve the request to a user per AUTH_MODE. In off/single_user the
-    bootstrap user is always returned (so handlers can assume a current user
-    exists); in multi_user an absent/expired/invalid session OR API key is
-    a 401.
-
-    Auth precedence in multi_user mode:
-      1. ``Authorization: Bearer sk_...`` (API key) — used by the CLI
-         (`SURGITE_API_KEY`) and any out-of-band caller.
-      2. The session cookie (``__Host-surgite_session``) — used by the SPA.
-
-    The API key path is checked first because a CLI request that
-    mistakenly also sends a stale cookie still authenticates; the cookie
-    path is the SPA's only path. A 401 from the API key path does NOT
-    fall through to the cookie path (and vice versa) — both are
-    independent auth attempts and either one resolving is enough."""
+    """Resolve the bootstrap user, Bearer key, or session for this request."""
     mode = config.AUTH_MODE
     if mode in ("off", "single_user"):
         return ensure_bootstrap_user(session)
 
-    # Bearer API key (CLI). Stays strictly orthogonal to the cookie path so a
-    # caller with a valid key never has to worry about stray cookies.
     auth_header = request.headers.get("authorization", "")
     if auth_header.lower().startswith("bearer "):
         token = auth_header[7:].strip()
@@ -607,8 +483,6 @@ def get_current_user(
     if user is None or not user.is_active:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
-    # Sliding sessions: refresh the expiry (and re-issue the cookie) when the
-    # session is within SESSION_REFRESH_THRESHOLD_DAYS of expiring.
     sess.last_seen_at = now
     if _as_utc(sess.expires_at) - now < timedelta(days=config.SESSION_REFRESH_THRESHOLD_DAYS):
         sess.expires_at = now + timedelta(days=config.SESSION_TTL_DAYS)
@@ -621,10 +495,7 @@ def get_optional_user(
     request: Request,
     session: Session = Depends(get_db),
 ) -> UserRow | None:
-    """Like get_current_user but never raises — returns None for an anonymous
-    multi_user request instead of a 401. Used by the unauthenticated health
-    endpoints so they can scope a probe to the caller's own repos when a
-    session happens to be present, without ever requiring one."""
+    """Resolve an optional session without raising for anonymous requests."""
     if config.AUTH_MODE in ("off", "single_user"):
         return ensure_bootstrap_user(session)
     sid = request.cookies.get(config.SESSION_COOKIE_NAME)

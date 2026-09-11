@@ -1,8 +1,4 @@
-// Thin typed client for the surgite API.
-//
-// In dev, the Vite server (:5173) calls FastAPI (:8000) cross-origin, so we point at the
-// backend explicitly. In a production build the SPA is served same-origin by FastAPI, so the
-// base is empty and requests are relative. Override either with VITE_API_BASE.
+// Development uses Vite's separate origin; production is same-origin.
 const BASE = import.meta.env.VITE_API_BASE ?? (import.meta.env.DEV ? 'http://localhost:8000' : '');
 
 export interface Repo {
@@ -49,10 +45,6 @@ const CSRF_HEADER = 'X-Requested-With';
 const CSRF_VALUE = 'surgite-web';
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-	// The CSRF middleware in surgite/api.py requires this header on every
-	// non-safe method in multi_user mode. We send it unconditionally so
-	// callers don't have to think about it; the server ignores it on safe
-	// methods and in off/single_user mode.
 	const method = (init?.method ?? 'GET').toUpperCase();
 	const headers: Record<string, string> = {
 		'Content-Type': 'application/json',
@@ -61,7 +53,6 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 	if (UNSAFE_METHODS.has(method)) headers[CSRF_HEADER] = CSRF_VALUE;
 	const res = await fetch(`${BASE}${path}`, { ...init, headers });
 	if (!res.ok) {
-		// FastAPI errors carry a `detail` field; fall back to the status text.
 		let detail: unknown = res.statusText;
 		try {
 			detail = (await res.json()).detail ?? res.statusText;
@@ -69,9 +60,6 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 			/* non-JSON body */
 		}
 		const message = typeof detail === 'string' ? detail : JSON.stringify(detail);
-		// ponytail: extra fields on the Error are cheaper than a custom class.
-		// `status` lets the auth guard distinguish 401 from any other failure;
-		// `lockoutSeconds` powers the login page's retry countdown.
 		const err = new Error(message) as Error & { status?: number; lockoutSeconds?: number };
 		err.status = res.status;
 		if (res.status === 423) {
@@ -80,7 +68,6 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 		}
 		throw err;
 	}
-	// 204 No Content (e.g. DELETE) has no body to parse.
 	return res.status === 204 ? (undefined as T) : res.json();
 }
 
@@ -221,7 +208,6 @@ export const createInvite = (req: AdminInviteRequest) =>
 	});
 
 export interface PromptSettings {
-	// null = the global default row; a number = a repo-specific override.
 	repo_id: number | null;
 	user_name: string;
 	user_role: string;
@@ -251,26 +237,17 @@ export const updatePromptSettings = (update: PromptSettingsUpdate, repoId?: numb
 export interface ProviderKey {
 	provider: string;
 	created_at: string | null;
-	// Non-null = the key was revoked, so the provider is NOT configured.
 	revoked_at: string | null;
 }
 
 export interface ProviderKeysResponse {
-	// The server's visible registry (LLM_LOCAL_ONLY filtered). Names only:
-	// whether a provider has a key configured is admin-only on /providers, so
-	// this deliberately carries no availability data. See docs/security.md.
 	providers: string[];
 	default: string;
 	keys: ProviderKey[];
 }
 
-// 404 in off/single_user mode (_require_multi_user) — the caller hides the
-// whole settings subsection rather than showing a broken form.
 export const fetchProviderKeys = () => request<ProviderKeysResponse>('/settings/provider-keys');
 
-// Set and clear are separate calls rather than one update(req) so that
-// { clear: true, key: '...' } — key material on the wire for no reason — can't
-// be expressed. The raw key is passed straight to the body and never retained.
 export const setProviderKey = (provider: string, key: string) =>
 	request<{ configured: boolean }>('/settings/provider-keys', {
 		method: 'PUT',
@@ -350,12 +327,7 @@ function summaryQuery(params: SummaryParams): string {
 	return q.toString();
 }
 
-/**
- * Stream an AI summary over SSE, invoking handlers as events arrive. Resolves
- * when the stream completes; rejects on a transport error or an HTTP error
- * status (so the caller can surface it like any other failure). Honour the
- * passed AbortSignal to cancel mid-stream.
- */
+/** Stream an AI summary, dispatching server-sent events as they arrive. */
 export async function streamSummary(
 	params: SummaryParams,
 	handlers: StreamHandlers,
@@ -382,7 +354,6 @@ export async function streamSummary(
 		const { value, done } = await reader.read();
 		if (done) break;
 		buffer += value;
-		// SSE frames are separated by a blank line.
 		let sep: number;
 		while ((sep = buffer.indexOf('\n\n')) !== -1) {
 			const frame = buffer.slice(0, sep);

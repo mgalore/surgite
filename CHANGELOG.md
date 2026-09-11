@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-09-10
+
 ### Added
 
 - Provider keys are now manageable from the web UI. The dashboard's Settings
@@ -287,7 +289,7 @@ this foundation.
   `surgite-*.sql.gz`). One-time effects: browser sessions are invalidated
   (everyone logs in again once); CLI sessions migrate automatically or
   re-login. Upgrade steps for existing deployments:
-  [`docs/self-host.md`](docs/self-host.md#upgrading-from-standup-gen-pre-rename).
+  [`docs/migrations/0.6.0-to-1.0.0.md`](docs/migrations/0.6.0-to-1.0.0.md#renaming-standup-gen).
 
 ### Removed
 
@@ -299,7 +301,7 @@ this foundation.
 
 The API-stability release. 0.6.0 makes the contract with downstream users
 explicit: a snapshot-tested OpenAPI surface, a written stability policy, a
-deprecation procedure, and a security-support commitment.
+deprecation procedure, and a security support commitment.
 
 ### Added
 
@@ -312,7 +314,7 @@ deprecation procedure, and a security-support commitment.
 - `docs/api-stability.md` — the public API stability policy: what we
   promise not to break in a minor, what we reserve the right to change,
   and how the deprecation cycle works.
-- `docs/security-support.md` — supported versions, the
+- `SECURITY.md` — supported versions, the
   vulnerability-response SLA, and the advisory process.
 - **CLI keyring storage.** `standup --login` / `--redeem-invite` now store
   the session cookie in the OS keyring (macOS Keychain, Linux Secret

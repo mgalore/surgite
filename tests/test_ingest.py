@@ -262,11 +262,11 @@ async def test_lifespan_clears_ingest_executor(monkeypatch):
 
 def test_scheduler_runs_periodically(client_with_scheduler, add_repo, fake_git):
     """With INGEST_INTERVAL=1 and one registered repo, the scheduler should
-    call _ingest_all_repos at least twice within ~2.5 seconds (initial
-    run at t=0, second run ~1s later)."""
+    call _ingest_all_repos at least twice within the startup and two-tick
+    window (the scheduler may start before the repo is registered)."""
     add_repo()
     fake_git.commits = make_commits(2)
-    deadline = time.monotonic() + 2.5
+    deadline = time.monotonic() + 4
     while time.monotonic() < deadline:
         if fake_git.calls >= 2:
             break

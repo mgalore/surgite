@@ -69,10 +69,10 @@
 			<div class="mt-1 border-b border-dashed border-border-subtle"></div>
 
 			<div class="mt-3 flex gap-1 border-b border-border-subtle text-sm" role="tablist" aria-label="Summary ownership">
-				<button id="mine-tab" type="button" role="tab" aria-controls="mine-panel" aria-selected={tab === 'mine'} onclick={() => (tab = 'mine')} onkeydown={(event) => handleTabKeydown(event, 'mine')} class="border-b-2 px-3 py-1.5 transition {tab === 'mine' ? 'border-accent text-fg' : 'border-transparent text-fg-muted hover:text-fg'}">
+				<button id="mine-tab" type="button" role="tab" aria-controls="mine-panel" aria-selected={tab === 'mine'} tabindex={tab === 'mine' ? 0 : -1} onclick={() => (tab = 'mine')} onkeydown={(event) => handleTabKeydown(event, 'mine')} class="border-b-2 px-3 py-1.5 transition {tab === 'mine' ? 'border-accent text-fg' : 'border-transparent text-fg-muted hover:text-fg'}">
 					Created by me <span class="text-fg-faint">({total})</span>
 				</button>
-				<button id="shared-tab" type="button" role="tab" aria-controls="shared-panel" aria-selected={tab === 'shared'} onclick={() => (tab = 'shared')} onkeydown={(event) => handleTabKeydown(event, 'shared')} class="border-b-2 px-3 py-1.5 transition {tab === 'shared' ? 'border-accent text-fg' : 'border-transparent text-fg-muted hover:text-fg'}">
+				<button id="shared-tab" type="button" role="tab" aria-controls="shared-panel" aria-selected={tab === 'shared'} tabindex={tab === 'shared' ? 0 : -1} onclick={() => (tab = 'shared')} onkeydown={(event) => handleTabKeydown(event, 'shared')} class="border-b-2 px-3 py-1.5 transition {tab === 'shared' ? 'border-accent text-fg' : 'border-transparent text-fg-muted hover:text-fg'}">
 					Shared with me
 				</button>
 			</div>
